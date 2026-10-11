@@ -212,8 +212,8 @@ func sigV4(secretKey, region, amzDate string, headers map[string]string, signed 
 // exists.
 func TestWorkloadIdentityFederation(t *testing.T) {
 	clk := newClock()
-	// Throwaway credentials in AWS's shape, made up here.
-	creds := aws.Credentials{AccessKeyID: "ASIATESTTESTTESTTEST", SecretAccessKey: "test-secret-access-key/not-real", SessionToken: "test-session-token"}
+	// Throwaway credentials, made up here; not in AWS's key-id shape, so secret scanners do not flag them.
+	creds := aws.Credentials{AccessKeyID: "TEST-KEY-ID-NOT-REAL", SecretAccessKey: "test-secret-access-key/not-real", SessionToken: "test-session-token"}
 	const audience = "//iam.googleapis.com/projects/123456789012/locations/global/workloadIdentityPools/vettid-aws/providers/vettid-main"
 	var mu sync.Mutex
 	var exchanges, impersonations int
@@ -257,7 +257,7 @@ func TestWorkloadIdentityFederation(t *testing.T) {
 			h["x-amz-security-token"] != "test-session-token" || h["x-amz-date"] != clk.now().UTC().Format("20060102T150405Z") {
 			t.Errorf("subject token headers %v", h)
 		}
-		m := regexp.MustCompile(`^AWS4-HMAC-SHA256 Credential=ASIATESTTESTTESTTEST/(\d{8})/us-east-1/sts/aws4_request, SignedHeaders=([a-z0-9;-]+), Signature=([0-9a-f]{64})$`).FindStringSubmatch(h["authorization"])
+		m := regexp.MustCompile(`^AWS4-HMAC-SHA256 Credential=TEST-KEY-ID-NOT-REAL/(\d{8})/us-east-1/sts/aws4_request, SignedHeaders=([a-z0-9;-]+), Signature=([0-9a-f]{64})$`).FindStringSubmatch(h["authorization"])
 		if m == nil {
 			t.Errorf("Authorization %q", h["authorization"])
 			w.WriteHeader(400)

@@ -224,7 +224,7 @@ func TestManifests(t *testing.T) {
 		return nsmtest.Release(n, nsmtest.PCRHex(b), status)
 	}
 	m := &Manifests{Keys: prodLike(signer)}
-	if ok, loaded := m.Admits(nsmtest.PCRHex(4)); ok || loaded {
+	if ok, why := m.Admits(nsmtest.PCRHex(4)); ok || why != ReasonNoManifest {
 		t.Fatal("an empty holder admits or claims a manifest")
 	}
 	if err := m.Load(signer.Served(7, rel(1, 1, manifest.StatusRemoved), rel(2, 2, manifest.StatusRetired),
@@ -232,7 +232,7 @@ func TestManifests(t *testing.T) {
 		t.Fatal(err)
 	}
 	for b, want := range map[byte]bool{1: false, 2: false, 3: true, 4: true, 9: false} {
-		if ok, loaded := m.Admits(nsmtest.PCRHex(b)); ok != want || !loaded {
+		if ok, why := m.Admits(nsmtest.PCRHex(b)); ok != want || why != "" {
 			t.Errorf("PCR0 %02x: admitted %v, want %v", b, ok, want)
 		}
 	}
@@ -340,5 +340,156 @@ func TestManifestRefresh(t *testing.T) {
 	<-done
 	if ok, _ := m.Admits(nsmtest.PCRHex(2)); !ok {
 		t.Fatal("release 2 does not register after the refresh")
+	}
+}
+
+// §14.2 question 15: a manifest is trusted for 7 days since the last
+// successful refresh. Just under: trusted. At and after: refused as
+// manifest_stale, whatever the PCR0, until a refresh succeeds; a refresh
+// that fails renews nothing. Nothing of it outlives the holder.
+func TestManifestMaxAge(t *testing.T) {
+	signer := nsmtest.NewManifestSigner()
+	var body atomic.Value
+	var status atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(int(status.Load()))
+		_, _ = w.Write(body.Load().([]byte))
+	}))
+	defer srv.Close()
+	at := t0
+	clock := func() time.Time { return at }
+	m := &Manifests{URL: srv.URL, Keys: prodLike(signer), Now: clock}
+	ctx := context.Background()
+	listed, unlisted := nsmtest.PCRHex(1), nsmtest.PCRHex(9)
+	check := func(when string, wantOK bool, wantWhy Reason) {
+		t.Helper()
+		if ok, why := m.Admits(listed); ok != wantOK || why != wantWhy {
+			t.Fatalf("%s: admitted %v (%q), want %v (%q)", when, ok, why, wantOK, wantWhy)
+		}
+		if ok, why := m.Admits(unlisted); ok || why != wantWhy {
+			t.Fatalf("%s, unlisted PCR0: admitted %v (%q)", when, ok, why)
+		}
+		if m.Stale() != (wantWhy == ReasonManifestStale) {
+			t.Fatalf("%s: Stale() = %v", when, m.Stale())
+		}
+	}
+	serve := func(code int, b []byte) { status.Store(int32(code)); body.Store(b) }
+	v5 := signer.Served(5, nsmtest.Release(1, listed, manifest.StatusActive))
+
+	// No manifest is not a stale one, however long it lasts: a channel
+	// that has published nothing, and a site that cannot be reached.
+	serve(404, []byte("not found"))
+	if err := m.Refresh(ctx); !errors.Is(err, ErrNotPublished) {
+		t.Fatal(err)
+	}
+	at = at.Add(30 * 24 * time.Hour)
+	check("nothing published for a month", false, ReasonNoManifest)
+
+	serve(200, v5)
+	if err := m.Refresh(ctx); err != nil {
+		t.Fatal(err)
+	}
+	good := at
+	check("just refreshed", true, "")
+
+	// Every kind of failed refresh, for a week: none renews the manifest.
+	failures := []struct {
+		code int
+		body []byte
+		want error
+	}{
+		{503, []byte("down"), ErrFetch},
+		{404, []byte("not found"), ErrNotPublished}, // unpublished after it was published
+		{200, signer.Served(4, nsmtest.Release(1, listed, manifest.StatusActive)), ErrRollback},
+		{200, nsmtest.NewManifestSigner().Served(6, nsmtest.Release(1, listed, manifest.StatusActive)), manifest.ErrKey},
+	}
+	for i, f := range failures {
+		at = good.Add(time.Duration(i+1) * 24 * time.Hour)
+		serve(f.code, f.body)
+		if err := m.Refresh(ctx); !errors.Is(err, f.want) {
+			t.Fatalf("failure %d: %v", i, err)
+		}
+		check("a failed refresh within the week", true, "")
+	}
+	at = good.Add(MaxManifestAge - time.Nanosecond)
+	check("just under 7 days", true, "")
+	at = good.Add(MaxManifestAge)
+	check("at 7 days", false, ReasonManifestStale)
+	at = good.Add(MaxManifestAge + 90*24*time.Hour)
+	check("long after", false, ReasonManifestStale)
+	if m.Serial() != 5 {
+		t.Fatalf("a stale manifest lost its serial: %d", m.Serial())
+	}
+	// Still failing: still stale, and the serial rule still holds.
+	if err := m.Refresh(ctx); !errors.Is(err, manifest.ErrKey) {
+		t.Fatal(err)
+	}
+	serve(200, signer.Served(4, nsmtest.Release(9, unlisted, manifest.StatusActive)))
+	if err := m.Refresh(ctx); !errors.Is(err, ErrRollback) {
+		t.Fatalf("a lower serial while stale: %v", err)
+	}
+	check("after failed refreshes while stale", false, ReasonManifestStale)
+
+	// The same manifest served again is a successful refresh: trust is
+	// back at once, for another 7 days from now.
+	serve(200, v5)
+	if err := m.Refresh(ctx); err != nil {
+		t.Fatal(err)
+	}
+	check("refreshed after being stale", true, "")
+	good = at
+	at = good.Add(MaxManifestAge - time.Second)
+	check("just under 7 days after the second refresh", true, "")
+	// A new manifest renews it as well.
+	serve(200, signer.Served(6, nsmtest.Release(1, listed, manifest.StatusDeprecated)))
+	if err := m.Refresh(ctx); err != nil {
+		t.Fatal(err)
+	}
+	at = at.Add(MaxManifestAge - time.Second)
+	check("just under 7 days after serial 6", true, "")
+	at = at.Add(time.Second)
+	check("7 days after serial 6", false, ReasonManifestStale)
+
+	// A restart: nothing is persisted. The new holder has no manifest
+	// (not a stale one) while the site is away, then trusts what the site
+	// serves, a lower serial included, for a full 7 days from then.
+	m = &Manifests{URL: srv.URL, Keys: prodLike(signer), Now: clock}
+	serve(503, []byte("down"))
+	if err := m.Refresh(ctx); !errors.Is(err, ErrFetch) {
+		t.Fatal(err)
+	}
+	check("restarted without the site", false, ReasonNoManifest)
+	serve(200, v5)
+	if err := m.Refresh(ctx); err != nil || m.Serial() != 5 {
+		t.Fatalf("restart: %v serial %d", err, m.Serial())
+	}
+	at = at.Add(MaxManifestAge - time.Nanosecond)
+	check("restarted, just under 7 days", true, "")
+	at = at.Add(time.Nanosecond)
+	check("restarted, at 7 days", false, ReasonManifestStale)
+
+	// The verifier reports it as its own reason, after the document's
+	// own checks.
+	nsm := nsmtest.New(1, clock)
+	pub, _, _ := ed25519.GenerateKey(rand.Reader)
+	digest := sha256.Sum256([]byte("canonical"))
+	v := &Verifier{Roots: nsm.Roots(), Releases: m, Now: clock}
+	doc := []string{nsmtest.Header(nsm.AttestAt(at, digest[:], nil, pub))}
+	if got := reason(v.Verify(doc, pub, digest)); got != ReasonManifestStale {
+		t.Fatalf("a registration under a stale manifest: %s", got)
+	}
+	if got := reason(v.Verify(doc, pub, sha256.Sum256([]byte("another")))); got != ReasonUserData {
+		t.Fatalf("the document's own checks come first: %s", got)
+	}
+	if MaxManifestAge != 7*24*time.Hour {
+		t.Fatal(MaxManifestAge)
+	}
+	// The default clock is the system's.
+	d := &Manifests{Keys: prodLike(signer)}
+	if err := d.Load(v5); err != nil {
+		t.Fatal(err)
+	}
+	if ok, why := d.Admits(listed); !ok || why != "" || d.Stale() {
+		t.Fatalf("default clock: %v %q", ok, why)
 	}
 }

@@ -189,7 +189,7 @@ interval, never per request):
 | `registrations` | `platform`, `outcome` | `outcome`: `ok` or the error code |
 | `wakes` | `platform`, `environment`, `outcome` | `outcome`: `sent`, `coalesced`, an error code, or `provider_rate_limited`, `provider_unavailable`, `provider_auth`, `provider_rejected` |
 | `provider_latency_ms` | `platform` | up to 100 sampled values per interval |
-| `attestation_failures` | `reason` | `missing`, `malformed`, `chain`, `signature`, `stale`, `public_key`, `user_data`, `pcr0`, `no_manifest` |
+| `attestation_failures` | `reason` | `missing`, `malformed`, `chain`, `signature`, `stale`, `public_key`, `user_data`, `pcr0`, `no_manifest`, `manifest_stale` |
 | `rate_limited` | `scope` | `token`, `address_register`, `address_wake`, `replay_cache` |
 | `blob_resealed` | | |
 | `manifest_refresh` | `outcome` | `ok`, `error`, `not_published` (for the "refresh failing" alarm) |
@@ -200,6 +200,12 @@ The alarms of §10.5 map to: provider auth failures =
 `wakes{outcome=provider_unavailable}` over all `wakes`; any `internal` =
 `internal_errors`; manifest refresh failing = `manifest_refresh{outcome=error}`;
 attestation failures = `attestation_failures`.
+
+The "manifest refresh failing" alarm (1 hour) is what keeps the maximum
+manifest age (7 days, below) from ever being reached: left unanswered for
+a week, it ends with every registration refused (wakes go on).
+`attestation_failures{reason=manifest_stale}` above zero means the limit
+was reached.
 
 ## API summary
 
@@ -276,10 +282,23 @@ this implementation does:
    published none: production before release 1 answers 404): registrations
    are refused `403 attestation_invalid` (metric reason `no_manifest`);
    wakes work. The gateway retries every minute until it has one.
-7. **A manifest that cannot be refreshed** stays trusted without an age
-   limit (the spec gives none); `manifest_refresh{outcome=error}` raises
-   the alarm. The serial rule lives in memory: a restarted task starts
-   from the manifest it then fetches.
+7. **A manifest that cannot be refreshed** stays trusted for **7 days
+   since the last successful refresh** (§14.2 question 15, approved
+   2026-10-11), then no longer: registrations are refused
+   `403 attestation_invalid` (metric reason `manifest_stale`, the same
+   answer as every other attestation refusal) until a refresh succeeds,
+   which restores trust at once. A successful refresh is a fetch whose
+   manifest verifies and passes the serial rule, the same manifest again
+   included; a 404 from a channel that had published (`outcome=error`),
+   a rollback or a bad signature is not one. Wakes are not affected: a
+   wake opens its blob and never consults the manifest. The refresh
+   stays at every 10 minutes while stale.
+   `manifest_refresh{outcome=error}` raises the alarm after an hour, so
+   the limit only closes the open-ended case. The age is counted on the
+   task's monotonic clock and, like the serial rule, lives in memory:
+   nothing is persisted, a restarted task starts from the manifest it
+   then fetches (with a fresh 7 days), or with none (`no_manifest`) if
+   the site cannot be reached.
 8. **Platform answers beyond §7's table.** FCM `SENDER_ID_MISMATCH` and
    APNs `DeviceTokenNotForTopic` are `400 token_invalid` (the token can
    never work for this app; only a new registration helps). Any APNs

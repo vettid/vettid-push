@@ -43,11 +43,13 @@ const (
 	ReasonUserData   Reason = "user_data"   // user_data is not the request's digest
 	ReasonPCR0       Reason = "pcr0"        // PCR0 is not an active or deprecated release
 	ReasonNoManifest Reason = "no_manifest" // no trusted manifest has been loaded yet
+	// the trusted manifest was last refreshed MaxManifestAge ago or more
+	ReasonManifestStale Reason = "manifest_stale"
 )
 
 // Reasons lists every reason.
 var Reasons = []Reason{ReasonMissing, ReasonMalformed, ReasonChain, ReasonSignature, ReasonStale,
-	ReasonPublicKey, ReasonUserData, ReasonPCR0, ReasonNoManifest}
+	ReasonPublicKey, ReasonUserData, ReasonPCR0, ReasonNoManifest, ReasonManifestStale}
 
 // Error is a refused document. The gateway's answer is the same
 // attestation_invalid for every reason.
@@ -58,9 +60,11 @@ func (e *Error) Error() string { return "attestation invalid: " + string(e.Reaso
 // Releases answers whether a PCR0 belongs to a release that may register.
 type Releases interface {
 	// Admits reports whether pcr0 (lowercase hex) is the PCR0 of an
-	// active or deprecated release. loaded is false while no trusted
-	// release list is known.
-	Admits(pcr0 string) (ok, loaded bool)
+	// active or deprecated release. While there is no release list to
+	// answer from, ok is false and why says so: ReasonNoManifest (none
+	// has been trusted yet) or ReasonManifestStale (the trusted one is
+	// past its maximum age). Otherwise why is empty.
+	Admits(pcr0 string) (ok bool, why Reason)
 }
 
 // Verifier checks registrations' attestation documents.
@@ -113,9 +117,9 @@ func (v *Verifier) Verify(header []string, key ed25519.PublicKey, digest [32]byt
 	if v.Releases == nil {
 		return &Error{ReasonNoManifest}
 	}
-	ok, loaded := v.Releases.Admits(doc.PCRHex(0))
-	if !loaded {
-		return &Error{ReasonNoManifest}
+	ok, why := v.Releases.Admits(doc.PCRHex(0))
+	if why != "" {
+		return &Error{why}
 	}
 	if !ok {
 		return &Error{ReasonPCR0}
@@ -128,10 +132,10 @@ func (v *Verifier) Verify(header []string, key ed25519.PublicKey, digest [32]byt
 type StaticReleases []string
 
 // Admits implements Releases.
-func (s StaticReleases) Admits(pcr0 string) (bool, bool) {
+func (s StaticReleases) Admits(pcr0 string) (bool, Reason) {
 	ok := 0
 	for _, p := range s {
 		ok |= subtle.ConstantTimeCompare([]byte(p), []byte(pcr0))
 	}
-	return ok == 1 && pcr0 != "", true
+	return ok == 1 && pcr0 != "", ""
 }

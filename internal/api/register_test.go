@@ -214,6 +214,10 @@ func TestRegisterManifest(t *testing.T) {
 	g := newGW(t, func(g *gw) {
 		g.cfg.Attest = &attest.Verifier{Roots: g.nsm.Roots(), Releases: m, Now: g.clk.now}
 	})
+	// The manifest's age has a clock of its own here: the test enclave's
+	// certificates do not live a week.
+	age := &clock{t: g.clk.now()}
+	m.Now = age.now
 	try := func() answer {
 		g.clk.add(time.Second)
 		return g.do(rawReq{path: pushwire.PathRegister, body: fcmReg.Body(), key: newKey(t)})
@@ -237,8 +241,50 @@ func TestRegisterManifest(t *testing.T) {
 	if err := m.Load(signer.Served(20, nsmtest.Release(2, nsmtest.PCRHex(0x55), manifest.StatusActive))); err != nil {
 		t.Fatal(err)
 	}
-	if a := try(); !a.is(403, "attestation_invalid") {
-		t.Errorf("a release dropped from the manifest: %d %s", a.status, a.body)
+	dropped := try()
+	if !dropped.is(403, "attestation_invalid") {
+		t.Errorf("a release dropped from the manifest: %d %s", dropped.status, dropped.body)
+	}
+
+	// §14.2 question 15: 7 days after the last successful refresh the
+	// manifest is no longer trusted. The answer is the one of every other
+	// attestation refusal; only the metric names the reason. A wake with
+	// a blob sealed before is not affected: it consults no manifest.
+	vault := newKey(t)
+	if err := m.Load(signer.Served(21, nsmtest.Release(1, pcr0, manifest.StatusActive))); err != nil {
+		t.Fatal(err)
+	}
+	g.clk.add(time.Second)
+	reg := g.do(rawReq{path: pushwire.PathRegister, body: fcmReg.Body(), key: vault})
+	if reg.status != 201 {
+		t.Fatalf("register: %d %s", reg.status, reg.body)
+	}
+	wb, _ := pushwire.ParseRegistered([]byte(reg.body))
+	age.add(attest.MaxManifestAge - time.Hour)
+	if a := try(); a.status != 201 {
+		t.Errorf("under 7 days: %d %s", a.status, a.body)
+	}
+	if g.count("attestation_failures", "reason", "manifest_stale") != 0 {
+		t.Error("manifest_stale counted before the limit")
+	}
+	age.add(time.Hour)
+	a := try()
+	if !a.is(403, "attestation_invalid") || a.body != dropped.body {
+		t.Errorf("stale manifest: %d %s (other refusals: %s)", a.status, a.body, dropped.body)
+	}
+	if g.count("attestation_failures", "reason", "manifest_stale") != 1 {
+		t.Error("attestation_failures{reason=manifest_stale} not counted")
+	}
+	g.clk.add(time.Second)
+	if a := g.do(rawReq{path: pushwire.PathWake, body: pushwire.WakeBody(wb), key: vault}); a.status != 202 || g.fcm.count() != 1 {
+		t.Errorf("a wake under a stale manifest: %d %s", a.status, a.body)
+	}
+	// A successful refresh, of the same manifest, restores trust.
+	if err := m.Load(signer.Served(21, nsmtest.Release(1, pcr0, manifest.StatusActive))); err != nil {
+		t.Fatal(err)
+	}
+	if a := try(); a.status != 201 {
+		t.Errorf("after a refresh: %d %s", a.status, a.body)
 	}
 }
 

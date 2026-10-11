@@ -17,6 +17,11 @@ import (
 // RefreshInterval is how often the manifest is fetched again (§5.1).
 const RefreshInterval = 10 * time.Minute
 
+// MaxManifestAge is how long a manifest stays trusted after the last
+// successful refresh (§14.2 question 15): from then on registrations are
+// refused (ReasonManifestStale) until a refresh succeeds.
+const MaxManifestAge = 7 * 24 * time.Hour
+
 // Manifest refresh errors.
 var (
 	// ErrNotPublished: the manifest URL answers 404 (a channel that has
@@ -31,7 +36,9 @@ var (
 
 // Manifests fetches, verifies and holds a channel's release manifest. The
 // zero serial means none has been trusted yet; the serial rule lives in
-// memory only (the gateway keeps no state across restarts).
+// memory only (the gateway keeps no state across restarts), and so does
+// the time of the last successful refresh, which the maximum age counts
+// from.
 type Manifests struct {
 	// URL is the channel's manifest URL.
 	URL string
@@ -40,18 +47,25 @@ type Manifests struct {
 	Keys []*ecdsa.PublicKey
 	// HTTP fetches the manifest (default: a client with a 10 s timeout).
 	HTTP *http.Client
+	// Now is the clock of the maximum age (default: time.Now, whose
+	// monotonic reading makes the age immune to wall clock steps).
+	Now func() time.Time
 
 	mu       sync.RWMutex
 	serial   uint64
 	sha      [32]byte
 	admitted map[string]struct{}
+	// refreshed is when a served manifest was last verified and trusted,
+	// the same one again included.
+	refreshed time.Time
 }
 
 var defaultManifestHTTP = &http.Client{Timeout: 10 * time.Second}
 
 // Refresh fetches the manifest, verifies it with the pinned keys, applies
 // the serial rule and, if all hold, trusts it. On any error the previous
-// manifest stays trusted.
+// manifest stays trusted, until it is MaxManifestAge old: only a refresh
+// that succeeds, with a new manifest or the same one again, renews it.
 func (m *Manifests) Refresh(ctx context.Context) error {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, m.URL, nil)
 	if err != nil {
@@ -103,22 +117,47 @@ func (m *Manifests) Load(served []byte) error {
 	if mf.CheckSerial(m.serial) != nil || mf.Serial == m.serial && sha != m.sha {
 		return ErrRollback
 	}
-	m.serial, m.sha, m.admitted = mf.Serial, sha, admitted
+	m.serial, m.sha, m.admitted, m.refreshed = mf.Serial, sha, admitted, m.now()
 	return nil
 }
 
-// Admits implements Releases: active and deprecated releases register.
-func (m *Manifests) Admits(pcr0 string) (ok, loaded bool) {
+func (m *Manifests) now() time.Time {
+	if m.Now != nil {
+		return m.Now()
+	}
+	return time.Now()
+}
+
+// stale is called with the lock held.
+func (m *Manifests) stale() bool {
+	return m.serial != 0 && m.now().Sub(m.refreshed) >= MaxManifestAge
+}
+
+// Admits implements Releases: active and deprecated releases register,
+// while the manifest is younger than MaxManifestAge.
+func (m *Manifests) Admits(pcr0 string) (ok bool, why Reason) {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 	if m.serial == 0 {
-		return false, false
+		return false, ReasonNoManifest
+	}
+	if m.stale() {
+		return false, ReasonManifestStale
 	}
 	_, ok = m.admitted[pcr0]
-	return ok, true
+	return ok, ""
 }
 
-// Serial returns the trusted manifest's serial (0: none yet).
+// Stale reports whether a manifest is held that is past its maximum age.
+func (m *Manifests) Stale() bool {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return m.stale()
+}
+
+// Serial returns the held manifest's serial (0: none yet). A stale
+// manifest keeps its serial: the serial rule still applies to the refresh
+// that follows.
 func (m *Manifests) Serial() uint64 {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
@@ -128,7 +167,8 @@ func (m *Manifests) Serial() uint64 {
 // Run refreshes every interval until ctx ends, reporting each outcome to
 // report (which may be nil). While no manifest is trusted yet it retries
 // every minute, so a gateway that started during an outage of the site
-// recovers quickly.
+// recovers quickly. A manifest past its maximum age is refreshed at the
+// ordinary interval.
 func (m *Manifests) Run(ctx context.Context, interval time.Duration, report func(error)) {
 	for {
 		wait := interval

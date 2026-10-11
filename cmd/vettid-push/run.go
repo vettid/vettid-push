@@ -249,6 +249,12 @@ func run(ctx context.Context, cfg config.Config, d deps) error {
 			}
 			if err != nil {
 				reg.Count("manifest_refresh", metrics.Dim{Name: "outcome", Value: "error"})
+				if manifests.Stale() {
+					// §14.2 question 15: seven days without a refresh.
+					logger.Error("manifest refresh failed and the manifest is past its maximum age; registrations are refused until a refresh succeeds",
+						"err", err.Error(), "stale_serial", manifests.Serial())
+					return
+				}
 				logger.Error("manifest refresh failed", "err", err.Error(), "trusted_serial", manifests.Serial())
 				return
 			}
@@ -256,7 +262,8 @@ func run(ctx context.Context, cfg config.Config, d deps) error {
 		}
 		// The first fetch is part of the start. If it fails the gateway
 		// still starts: wakes need no manifest, registrations are refused
-		// until a refresh succeeds.
+		// until a refresh succeeds. Later failures keep the manifest for
+		// attest.MaxManifestAge, no longer.
 		report(manifests.Refresh(startCtx))
 		wg.Add(1)
 		go func() { defer wg.Done(); manifests.Run(bg, attest.RefreshInterval, report) }()

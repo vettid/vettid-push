@@ -505,6 +505,19 @@ func TestStartConditions(t *testing.T) {
 	}
 }
 
+// §10.5: net/http's own error log names peer addresses ("http: TLS
+// handshake error from 203.0.113.9:1234"); the gateway's server discards
+// it.
+func TestServerErrorLogIsDiscarded(t *testing.T) {
+	srv := publicServer(http.NotFoundHandler())
+	if srv.ErrorLog == nil || srv.ErrorLog.Writer() != io.Discard {
+		t.Fatal("the HTTP server's error log is not discarded: it would log source addresses")
+	}
+	if srv.MaxHeaderBytes < 48<<10 {
+		t.Fatal("the header limit is below a full attestation header")
+	}
+}
+
 func TestHealthcheckCommand(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/v1/health" {

@@ -279,18 +279,7 @@ func run(ctx context.Context, cfg config.Config, d deps) error {
 		}
 	}()
 
-	pub := &http.Server{
-		Handler:           srv,
-		ReadHeaderTimeout: 10 * time.Second,
-		ReadTimeout:       20 * time.Second,
-		WriteTimeout:      30 * time.Second,
-		IdleTimeout:       120 * time.Second,
-		// The attestation header alone is about 6 KiB (at most 44 KiB).
-		MaxHeaderBytes: 64 << 10,
-		// net/http's own error lines name the peer's address; the
-		// gateway logs no source address (§10.5).
-		ErrorLog: log.New(io.Discard, "", 0),
-	}
+	pub := publicServer(srv)
 	ln, err := net.Listen("tcp", cfg.ListenAddr)
 	if err != nil {
 		return err
@@ -353,6 +342,22 @@ func run(ctx context.Context, cfg config.Config, d deps) error {
 	}
 	logger.Info("push gateway stopped")
 	return runErr
+}
+
+// publicServer is the gateway's HTTP server around h.
+func publicServer(h http.Handler) *http.Server {
+	return &http.Server{
+		Handler:           h,
+		ReadHeaderTimeout: 10 * time.Second,
+		ReadTimeout:       20 * time.Second,
+		WriteTimeout:      30 * time.Second,
+		IdleTimeout:       120 * time.Second,
+		// The attestation header alone is about 6 KiB (at most 44 KiB).
+		MaxHeaderBytes: 64 << 10,
+		// net/http's own error lines name the peer's address; the
+		// gateway logs no source address (§10.5).
+		ErrorLog: log.New(io.Discard, "", 0),
+	}
 }
 
 // buildProvider makes a platform's client from its secret (§10.2).

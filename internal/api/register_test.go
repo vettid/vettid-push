@@ -362,6 +362,11 @@ func TestRegisterAddressLimit(t *testing.T) {
 	if a := send("10.9.9.9, 203.0.113.9"); a.status != 429 {
 		t.Errorf("spoofed first hop: %d", a.status)
 	}
+	if a := g.do(rawReq{path: pushwire.PathRegister, body: body, mangle: func(h http.Header) {
+		h["X-Forwarded-For"] = []string{"10.8.8.8", "203.0.113.9"} // two header lines
+	}}); a.status != 429 {
+		t.Errorf("spoofed first header line: %d", a.status)
+	}
 	if a := send("203.0.113.10"); a.status != 401 {
 		t.Errorf("another address: %d", a.status)
 	}

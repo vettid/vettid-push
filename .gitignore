@@ -1,0 +1,19 @@
+# build output
+/bin/
+/dist/
+*.test
+*.out
+coverage.*
+
+# local working files and secrets never belong here
+/local/
+*.p8
+*.pem
+!internal/**/testdata/*.pem
+/secrets/
+
+# editors / OS
+.idea/
+.vscode/
+*.swp
+.DS_Store

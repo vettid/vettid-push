@@ -1,0 +1,27 @@
+# gitleaks configuration for vettid-push.
+# Extends the default ruleset. The only allowlisted values are the fixed,
+# test-only vector of PUSH-GATEWAY §15 (the all-0x03 seed, its PUBLIC key,
+# the signature derived from them and its placeholder push token), the
+# three PUBLIC manifest keys (SubjectPublicKeyInfo) the gateway pins, and
+# the made-up access tokens of the tests' fake Google endpoints. They are public by design and
+# appear in the specs. The real attestation document under
+# internal/attest/testdata is public data too (see its README).
+[extend]
+useDefault = true
+
+[allowlist]
+description = "PUSH-GATEWAY §15 test vector and pinned public keys (public)"
+regexTarget = "match"
+regexes = [
+  '''AwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwM=''',
+  '''7UkoxijRwsbq6QM4kFmVYSlZJzpcY/k2NsFGFKyHN9E=''',
+  '''3K\+q6jDs868\+0XetrLQXlddh8iZtKYeu5GRq6RZajyxRPIdDVh0dCYlkX59qFgL/wEhxs\+sSzsOyH02gpsBQDA==''',
+  '''MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAE[A-Za-z0-9+/]{80,90}={0,2}''',
+  # §15's placeholder APNs token ("corresponds to no device").
+  '''740f4707bebcf74f9b7c25d48e3358945f6aa01da5ddb387462c7eaf61bb78ad''',
+  # Made-up access tokens the fake Google endpoints of the tests hand out.
+  '''ya29\.(impersonated|e2e-access-token|grant|access)''',
+]
+paths = [
+  '''internal/attest/testdata/aws-attestation-2025-09-16\.b64''',
+]

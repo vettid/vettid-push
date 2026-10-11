@@ -1,0 +1,10 @@
+.git
+.github
+bin
+dist
+*.md
+Dockerfile
+.dockerignore
+.gitignore
+.gitleaks.toml
+Makefile

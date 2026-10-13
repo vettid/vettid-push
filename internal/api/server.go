@@ -246,9 +246,16 @@ func (s *Server) tokenKey(rec blob.Record) string {
 	return string(h.Sum(nil))
 }
 
-// auth reads the body and checks the signature, the freshness window and
-// the replay cache (Relay Protocol §4.1).
-func (s *Server) auth(r *http.Request) (relayauth.SignedRequest, []byte, *apiError) {
+// verify reads the body and checks the signature and the freshness
+// window (Relay Protocol §4.1). It records nothing: a signature proves
+// only that the sender holds some Ed25519 key, and keys are free, so a
+// request enters the replay cache (recordReplay) only once the handler
+// has established that the key is one the gateway knows: on a wake, the
+// key sealed in a blob of its own; on a registration, the key a vault
+// release attested for this very request. Everything a handler checks
+// between verify and recordReplay is a pure function of the request and
+// the gateway's configuration, with no effect on any state.
+func (s *Server) verify(r *http.Request) (relayauth.SignedRequest, []byte, *apiError) {
 	body, err := io.ReadAll(http.MaxBytesReader(nil, r.Body, MaxBody))
 	if err != nil {
 		return relayauth.SignedRequest{}, nil, fail(CodeBadRequest)
@@ -257,23 +264,33 @@ func (s *Server) auth(r *http.Request) (relayauth.SignedRequest, []byte, *apiErr
 	if err != nil {
 		return sr, nil, fail(CodeSignatureInvalid)
 	}
-	now := s.now()
-	if err := sr.Verify(http.MethodPost, r.URL.Path, relayauth.BodyHash(body), now); err != nil {
+	if err := sr.Verify(http.MethodPost, r.URL.Path, relayauth.BodyHash(body), s.now()); err != nil {
 		if errors.Is(err, relayauth.ErrTimestampStale) {
 			return sr, nil, fail(CodeTimestampStale)
 		}
 		return sr, nil, fail(CodeSignatureInvalid)
 	}
-	switch err := s.replay.Check(sr, now); {
-	case err == nil:
-	case errors.Is(err, relayauth.ErrReplayCacheFull):
-		// Overload: shed the request rather than admit it unrecorded.
-		s.m.Count("rate_limited", metrics.Dim{Name: "scope", Value: "replay_cache"})
-		return sr, nil, failAfter(CodeRateLimited, 1)
-	default:
-		return sr, nil, fail(CodeReplayDetected)
-	}
 	return sr, body, nil
+}
+
+// recordReplay refuses a request seen before and records one that was
+// not, in a single step under the cache's lock: of any number of
+// identical requests, concurrent or not, exactly one gets nil. A
+// handler calls it after its authenticating checks and before anything
+// with an effect (a limiter, the coalescer, a platform send, a seal),
+// so strangers cannot occupy the cache and a replay still changes
+// nothing. A full cache, which now takes that many live requests from
+// genuine vaults, sheds the request rather than admit it unrecorded.
+func (s *Server) recordReplay(sr relayauth.SignedRequest) *apiError {
+	switch err := s.replay.Check(sr, s.now()); {
+	case err == nil:
+		return nil
+	case errors.Is(err, relayauth.ErrReplayCacheFull):
+		s.m.Count("rate_limited", metrics.Dim{Name: "scope", Value: "replay_cache"})
+		return failAfter(CodeRateLimited, 1)
+	default:
+		return fail(CodeReplayDetected)
+	}
 }
 
 func contains(l []string, s string) bool {

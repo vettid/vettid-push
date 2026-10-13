@@ -308,7 +308,14 @@ this implementation does:
    `provider_rejected`) and logged. Every FCM `400` is taken as
    `token_invalid`, since the rest of the payload is fixed.
 9. **A full replay cache** sheds requests with `429 rate_limited`, as the
-   relay does.
+   relay does. A request is recorded in the cache only once its key is
+   one the gateway knows: a wake after its blob has opened for the
+   signer (§5.2 step 2), a registration after its attestation has
+   verified (§5.1 step 2). A request refused before that leaves no
+   record, so signed requests from strangers cannot fill the cache; sent
+   again, such a request gets the same refusal, not `replay_detected`.
+   The replay check still comes before anything with an effect (the
+   per-token limit, coalescing, the send, the seal).
 10. **A platform the gateway has no credentials for** is
     `platform_invalid`.
 11. **Body errors** are named in the order of §5.1 step 3: platform,

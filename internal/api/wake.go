@@ -29,8 +29,9 @@ func (s *Server) wake(w http.ResponseWriter, r *http.Request) {
 			s.m.Count("rate_limited", dim("scope", "address_wake"))
 			return failAfter(CodeRateLimited, ratelimit.RetryAfterSeconds(wait))
 		}
-		// 1. Signature, freshness, replay cache.
-		sr, body, e := s.auth(r)
+		// 1. Signature and freshness. The replay cache comes after
+		// step 2: until the blob has opened, the signer is a stranger.
+		sr, body, e := s.verify(r)
 		if e != nil {
 			return e
 		}
@@ -51,6 +52,11 @@ func (s *Server) wake(w http.ResponseWriter, r *http.Request) {
 			rec.Environment == provider.EnvSandbox && !s.cfg.AllowSandbox ||
 			(pushwire.Registration{Platform: rec.Platform, Token: rec.Token, AppID: rec.AppID, Environment: rec.Environment}).Validate() != nil {
 			return fail(CodeBlobInvalid)
+		}
+		// The replay cache, now that the request is a registered wake
+		// key's, and before anything below that has an effect.
+		if e := s.recordReplay(sr); e != nil {
+			return e
 		}
 		platform, env = platformDim(rec.Platform), envDim(rec.Environment)
 		// 3. The per-token limit.

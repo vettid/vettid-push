@@ -153,7 +153,7 @@ func TestLogAndMetricsCarryNoRequestData(t *testing.T) {
 		"environment": regexp.MustCompile(`^(production|sandbox|none)$`),
 		"outcome":     regexp.MustCompile(`^[a-z_]{2,32}$`),
 		"reason":      regexp.MustCompile(`^[a-z0-9_]{2,32}$`),
-		"scope":       regexp.MustCompile(`^(token|address_register|address_wake|replay_cache)$`),
+		"scope":       regexp.MustCompile(`^(token|address_register|address_wake|replay_cache|key)$`),
 	}
 	seen := map[string]bool{}
 	for _, l := range logLines(mbuf.String()) {

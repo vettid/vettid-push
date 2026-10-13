@@ -190,7 +190,7 @@ interval, never per request):
 | `wakes` | `platform`, `environment`, `outcome` | `outcome`: `sent`, `coalesced`, an error code, or `provider_rate_limited`, `provider_unavailable`, `provider_auth`, `provider_rejected` |
 | `provider_latency_ms` | `platform` | up to 100 sampled values per interval |
 | `attestation_failures` | `reason` | `missing`, `malformed`, `chain`, `signature`, `stale`, `public_key`, `user_data`, `pcr0`, `no_manifest`, `manifest_stale` |
-| `rate_limited` | `scope` | `token`, `address_register`, `address_wake`, `replay_cache` |
+| `rate_limited` | `scope` | `token`, `address_register`, `address_wake`, `replay_cache`, `key` (one key at its cap of live replay records) |
 | `blob_resealed` | | |
 | `manifest_refresh` | `outcome` | `ok`, `error`, `not_published` (for the "refresh failing" alarm) |
 | `internal_errors` | | every `500 internal` (for the "any internal" alarm) |
@@ -308,7 +308,23 @@ this implementation does:
    `provider_rejected`) and logged. Every FCM `400` is taken as
    `token_invalid`, since the rest of the payload is fixed.
 9. **A full replay cache** sheds requests with `429 rate_limited`, as the
-   relay does.
+   relay does. A request is checked against the cache and recorded in it
+   only once its key is one the gateway knows: a wake after its blob has
+   opened for the signer and its record is one the gateway would still
+   seal (§5.2 step 2), a registration after its attestation has verified
+   (§5.1 step 2). A request refused before that leaves no record, so
+   signed requests from strangers cannot fill the cache; sent again it
+   is checked afresh and is not answered `replay_detected`. A request
+   refused after that (a registration's body fault, a wake at the
+   per-token limit or refused by the platform) is recorded, so a retry
+   must be signed anew. Freshness and the replay check use one reading
+   of the clock. **One key has at most 32 live records** (twice what the
+   per-token limit can admit in a record's life, plus the registration;
+   more if the token limits are raised): beyond that this key's requests
+   are `429 rate_limited` with the time until one expires, and nobody
+   else's are affected, so one registered key cannot fill the cache
+   either. The cache and these counts live in each task's memory, so
+   with several tasks a request can be accepted once by each.
 10. **A platform the gateway has no credentials for** is
     `platform_invalid`.
 11. **Body errors** are named in the order of §5.1 step 3: platform,

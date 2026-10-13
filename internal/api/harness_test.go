@@ -30,10 +30,23 @@ var t0 = time.Date(2026, 10, 11, 12, 0, 0, 0, time.UTC)
 type clock struct {
 	mu sync.Mutex
 	t  time.Time
+	// step, if set, passes between one reading and the next.
+	step time.Duration
 }
 
-func (c *clock) now() time.Time      { c.mu.Lock(); defer c.mu.Unlock(); return c.t }
+func (c *clock) now() time.Time {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	t := c.t
+	c.t = c.t.Add(c.step)
+	return t
+}
 func (c *clock) add(d time.Duration) { c.mu.Lock(); c.t = c.t.Add(d); c.mu.Unlock() }
+func (c *clock) set(t time.Time, step time.Duration) {
+	c.mu.Lock()
+	c.t, c.step = t, step
+	c.mu.Unlock()
+}
 
 // fakeProvider records what the gateway hands a platform client.
 type fakeProvider struct {

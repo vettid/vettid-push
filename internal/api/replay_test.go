@@ -13,7 +13,9 @@ import (
 	"github.com/vettid/vettid-relay/relayauth"
 	"github.com/vettid/vettid-vault/vms/pushwire"
 
+	"github.com/vettid/vettid-push/internal/blob"
 	"github.com/vettid/vettid-push/internal/nsmtest"
+	"github.com/vettid/vettid-push/internal/provider"
 )
 
 // The replay cache holds only requests whose key the gateway knows: a
@@ -46,19 +48,27 @@ func TestRefusedRequestTakesNoReplaySlot(t *testing.T) {
 		t.Fatalf("%d records after two registrations", base)
 	}
 	regBody := fcmReg.Body()
+	// A blob that opens for its signer but whose record the gateway
+	// would no longer seal (its app has left the channel's list).
+	gone, err := g.cfg.Keys.Seal(blob.Record{Platform: "fcm", AppID: "com.example.gone", Token: "t", Key: key.Public().(ed25519.PublicKey)})
+	if err != nil {
+		t.Fatal(err)
+	}
 	strangerDoc, _ := g.nsm.Attest(make([]byte, 32), nil, newKey(t).Public().(ed25519.PublicKey))
 	for name, c := range map[string]struct {
 		q    rawReq
 		code string
 	}{
-		"wake: a stranger's key, a garbage blob":   {rawReq{path: pushwire.PathWake, body: pushwire.WakeBody("AAAA"), key: newKey(t)}, "blob_invalid"},
-		"wake: a stranger's key, a genuine blob":   {rawReq{path: pushwire.PathWake, body: pushwire.WakeBody(wb), key: newKey(t)}, "blob_invalid"},
-		"wake: another vault's key":                {rawReq{path: pushwire.PathWake, body: pushwire.WakeBody(wb), key: otherKey}, "blob_invalid"},
-		"wake: a stranger's key, not a wake body":  {rawReq{path: pushwire.PathWake, body: []byte(`{}`), key: newKey(t)}, "bad_request"},
-		"wake: a stranger, 89 s ahead":             {rawReq{path: pushwire.PathWake, body: pushwire.WakeBody("AAAA"), key: newKey(t), at: t0.Add(89 * time.Second)}, "blob_invalid"},
-		"register: no attestation":                 {rawReq{path: pushwire.PathRegister, body: regBody, key: newKey(t), attest: str("")}, "attestation_invalid"},
-		"register: not an attestation":             {rawReq{path: pushwire.PathRegister, body: regBody, key: newKey(t), attest: str("AAAA")}, "attestation_invalid"},
-		"register: an attestation for another key": {rawReq{path: pushwire.PathRegister, body: regBody, key: newKey(t), attest: str(nsmtest.Header(strangerDoc))}, "attestation_invalid"},
+		"wake: a stranger's key, a garbage blob":      {rawReq{path: pushwire.PathWake, body: pushwire.WakeBody("AAAA"), key: newKey(t)}, "blob_invalid"},
+		"wake: a stranger's key, a genuine blob":      {rawReq{path: pushwire.PathWake, body: pushwire.WakeBody(wb), key: newKey(t)}, "blob_invalid"},
+		"wake: its own blob, an app no longer listed": {rawReq{path: pushwire.PathWake, body: pushwire.WakeBody(gone), key: key}, "blob_invalid"},
+		"wake: its own key, class sync":               {rawReq{path: pushwire.PathWake, body: []byte(`{"wake_blob":"` + wb + `","class":"sync"}`), key: key}, "bad_request"},
+		"wake: another vault's key":                   {rawReq{path: pushwire.PathWake, body: pushwire.WakeBody(wb), key: otherKey}, "blob_invalid"},
+		"wake: a stranger's key, not a wake body":     {rawReq{path: pushwire.PathWake, body: []byte(`{}`), key: newKey(t)}, "bad_request"},
+		"wake: a stranger, 89 s ahead":                {rawReq{path: pushwire.PathWake, body: pushwire.WakeBody("AAAA"), key: newKey(t), at: t0.Add(89 * time.Second)}, "blob_invalid"},
+		"register: no attestation":                    {rawReq{path: pushwire.PathRegister, body: regBody, key: newKey(t), attest: str("")}, "attestation_invalid"},
+		"register: not an attestation":                {rawReq{path: pushwire.PathRegister, body: regBody, key: newKey(t), attest: str("AAAA")}, "attestation_invalid"},
+		"register: an attestation for another key":    {rawReq{path: pushwire.PathRegister, body: regBody, key: newKey(t), attest: str(nsmtest.Header(strangerDoc))}, "attestation_invalid"},
 	} {
 		q := replayed(c.q)
 		// Twice: the identical request again is refused for the same
@@ -70,6 +80,10 @@ func TestRefusedRequestTakesNoReplaySlot(t *testing.T) {
 		}
 		if n := g.srv.replay.Len(); n != base {
 			t.Fatalf("%s: the replay cache holds %d records, want %d", name, n, base)
+		}
+		// Nor does a refused request's key reach the per-key counts.
+		if keys, recs := g.srv.perKey.size(); keys != 2 || recs != 2 {
+			t.Fatalf("%s: the per-key counts hold %d keys and %d records, want 2 and 2", name, keys, recs)
 		}
 	}
 	// An accepted request is recorded.
@@ -88,7 +102,9 @@ func TestRefusedRequestTakesNoReplaySlot(t *testing.T) {
 // cache many times over, does not cost a vault its wake or its
 // registration.
 func TestStrangersCannotFillReplayCache(t *testing.T) {
-	const max = 64 // two records a shard
+	// Four records a shard: the three genuine requests below fit
+	// whichever shards they fall in.
+	const max = 128
 	g := newGW(t, func(g *gw) { g.cfg.Limits.ReplayCacheMax, g.cfg.Limits.RegisterPerMinute = max, 1000 })
 	key, wb := g.register(fcmReg)
 	regBody := fcmReg.Body()
@@ -165,8 +181,11 @@ func TestReplayOfAcceptedRequestRefused(t *testing.T) {
 }
 
 // Many copies of one valid request at the same moment: exactly one is
-// accepted. The check and the record are one step under the cache's
-// lock, and nothing with an effect comes before it.
+// accepted, by one task (the cache is per process). The check and the
+// record are one step under the cache's lock, in
+// relayauth.ReplayCache.Check, and nothing a replay must not repeat
+// comes before it. This test cannot prove there is no gap between a
+// lookup and a record: that rests on Check doing both under its lock.
 func TestConcurrentDuplicatesAcceptedOnce(t *testing.T) {
 	const copies = 48
 	for _, path := range []string{pushwire.PathWake, pushwire.PathRegister} {
@@ -275,5 +294,219 @@ func TestFullReplayCacheOfValidRequestsSheds(t *testing.T) {
 	g.clk.add(92 * time.Second)
 	if a := g.do(rawReq{path: pushwire.PathRegister, body: regBody, key: newKey(t)}); a.status != 201 {
 		t.Fatalf("after expiry: %d %s", a.status, a.body)
+	}
+}
+
+// A request refused after the replay check is recorded all the same:
+// the identical bytes again are replay_detected, and a retry must be
+// signed anew. This pins where the check sits: before a registration's
+// body is looked at and before a wake's per-token limit.
+func TestRefusedAfterReplayCheckIsRecorded(t *testing.T) {
+	g := newGW(t, func(g *gw) { g.cfg.Limits.Coalesce = 0 })
+	for name, c := range map[string]struct {
+		body string
+		code string
+	}{
+		"a body that is not a registration": {`{}`, "bad_request"},
+		"an unknown platform":               {`{"platform":"webpush","token":"t","app_id":"a"}`, "platform_invalid"},
+		"an app not in the list":            {`{"platform":"fcm","token":"t","app_id":"com.example.other"}`, "app_invalid"},
+	} {
+		before := g.srv.replay.Len()
+		q := replayed(rawReq{path: pushwire.PathRegister, body: []byte(c.body), key: newKey(t)})
+		if a := g.do(q); a.code != c.code {
+			t.Fatalf("%s: %d %s, want %s", name, a.status, a.body, c.code)
+		}
+		if a := g.do(q); !a.is(401, "replay_detected") {
+			t.Errorf("%s, sent again: %d %s", name, a.status, a.body)
+		}
+		if n := g.srv.replay.Len(); n != before+1 {
+			t.Errorf("%s: %d new records, want 1", name, n-before)
+		}
+	}
+	// A wake refused at the per-token limit.
+	key, wb := g.register(fcmReg)
+	for i := 0; i < 10; i++ {
+		g.clk.add(time.Millisecond)
+		if a := g.do(rawReq{path: pushwire.PathWake, body: pushwire.WakeBody(wb), key: key}); a.status != 202 {
+			t.Fatalf("wake %d: %d %s", i+1, a.status, a.body)
+		}
+	}
+	g.clk.add(time.Millisecond)
+	q := replayed(rawReq{path: pushwire.PathWake, body: pushwire.WakeBody(wb), key: key})
+	if a := g.do(q); !a.is(429, "rate_limited") {
+		t.Fatalf("11th wake: %d %s", a.status, a.body)
+	}
+	if a := g.do(q); !a.is(401, "replay_detected") {
+		t.Errorf("11th wake, sent again: %d %s", a.status, a.body)
+	}
+	// And one the platform refused.
+	key2, wb2 := g.register(apnsReg)
+	g.apns.set(provider.Result{Outcome: provider.TokenGone})
+	q = replayed(rawReq{path: pushwire.PathWake, body: pushwire.WakeBody(wb2), key: key2})
+	if a := g.do(q); a.code != "token_gone" {
+		t.Fatalf("token_gone: %d %s", a.status, a.body)
+	}
+	if a := g.do(q); !a.is(401, "replay_detected") {
+		t.Errorf("token_gone, sent again: %d %s", a.status, a.body)
+	}
+	if g.apns.count() != 1 {
+		t.Errorf("%d sends", g.apns.count())
+	}
+}
+
+// Freshness and the replay check use one reading of the clock. A record
+// expires a second after its timestamp stops being fresh, so were the
+// clock read again for the replay check, a replay arriving at the very
+// edge of the window, on a gateway slow enough for a second to pass
+// between the two, would be fresh and then find its record expired.
+func TestReplayAtEdgeOfWindowWithSlowClock(t *testing.T) {
+	g := newGW(t)
+	key, wb := g.register(fcmReg)
+	g.clk.add(time.Hour)
+	at := g.clk.now()
+	q := replayed(rawReq{path: pushwire.PathWake, body: pushwire.WakeBody(wb), key: key, at: at})
+	if a := g.do(q); a.status != 202 {
+		t.Fatalf("wake: %d %s", a.status, a.body)
+	}
+	// Every reading of the clock is now a second after the one before.
+	// Whichever reading freshness is judged by, one of these starts
+	// puts it at the last fresh instant.
+	for back := 0; back <= 6; back++ {
+		g.clk.set(at.Add(relayauth.FreshnessWindow-time.Duration(back)*time.Second), time.Second)
+		a := g.do(q)
+		if !a.is(401, "replay_detected") && !a.is(401, "timestamp_stale") {
+			t.Errorf("replay with the clock %d s before the edge: %d %s", back, a.status, a.body)
+		}
+	}
+	if g.fcm.count() != 1 {
+		t.Fatalf("%d sends for one accepted wake", g.fcm.count())
+	}
+}
+
+// One registered key cannot fill the cache either: it has a cap of live
+// records, beyond which its requests alone are refused.
+func TestOneKeyCannotFillReplayCache(t *testing.T) {
+	g := newGW(t)
+	limit := replayPerKey(g.cfg.Limits)
+	if limit != 32 || replayPerKey(Limits{TokenPerHour: 600, TokenBurst: 100}) != 2*(100+31+1) {
+		t.Fatalf("the cap is %d", limit)
+	}
+	key, wb := g.register(fcmReg)
+	other, otherBlob := g.register(apnsReg)
+	const n = 1280
+	answers := map[string]int{}
+	for i := 0; i < n; i++ {
+		g.clk.add(time.Millisecond) // a new timestamp, so a new signature
+		a := g.do(rawReq{path: pushwire.PathWake, body: pushwire.WakeBody(wb), key: key})
+		answers[a.code]++
+		if a.status != 202 && !a.is(429, "rate_limited") {
+			t.Fatalf("wake %d: %d %s", i+1, a.status, a.body)
+		}
+	}
+	// The key's registration and limit-1 wakes are recorded, 10 of
+	// them inside the token's burst; the rest are refused untouched.
+	atCap := float64(n - (limit - 1))
+	if answers[""] != 10 || answers["rate_limited"] != n-10 || g.count("rate_limited", "scope", "key") != atCap ||
+		g.count("rate_limited", "scope", "token") != float64(limit-1-10) {
+		t.Fatalf("answers %v; at the cap %v, at the token limit %v", answers,
+			g.count("rate_limited", "scope", "key"), g.count("rate_limited", "scope", "token"))
+	}
+	if got := g.srv.replay.Len(); got != limit+1 {
+		t.Fatalf("the replay cache holds %d records, want %d for this key and 1 for the other", got, limit)
+	}
+	if keys, recs := g.srv.perKey.size(); keys != 2 || recs != limit+1 {
+		t.Fatalf("the per-key counts hold %d keys and %d records", keys, recs)
+	}
+	// The answer says when the first of the key's records expires.
+	if a := g.do(rawReq{path: pushwire.PathWake, body: pushwire.WakeBody(wb), key: key}); !a.is(429, "rate_limited") || a.retry < 89 || a.retry > 91 {
+		t.Fatalf("at the cap: %d %s", a.status, a.body)
+	}
+	// Another vault is not affected, and the cache is far from full.
+	if a := g.do(rawReq{path: pushwire.PathWake, body: pushwire.WakeBody(otherBlob), key: other}); a.status != 202 {
+		t.Fatalf("another vault's wake: %d %s", a.status, a.body)
+	}
+	if g.count("rate_limited", "scope", "replay_cache") != 0 {
+		t.Error("rate_limited{scope=replay_cache} counted")
+	}
+	// Its records expire and the key is served again.
+	g.clk.add(92 * time.Second)
+	g.srv.Sweep()
+	if keys, recs := g.srv.perKey.size(); keys != 0 || recs != 0 || g.srv.replay.Len() != 0 {
+		t.Fatalf("after expiry: %d keys, %d records, %d in the cache", keys, recs, g.srv.replay.Len())
+	}
+	if a := g.do(rawReq{path: pushwire.PathWake, body: pushwire.WakeBody(wb), key: key}); a.status != 202 {
+		t.Fatalf("after expiry: %d %s", a.status, a.body)
+	}
+}
+
+// The most a vault can do within its token's limit stays under the cap:
+// the registration, the whole burst at once, then for ten minutes every
+// wake the limit admits and, each minute, two more that it refuses.
+func TestLegitimateBurstStaysUnderKeyCap(t *testing.T) {
+	g := newGW(t, func(g *gw) { g.cfg.Limits.Coalesce = 0 })
+	key, wb := g.register(fcmReg)
+	wake := func() answer {
+		g.clk.add(10 * time.Millisecond)
+		return g.do(rawReq{path: pushwire.PathWake, body: pushwire.WakeBody(wb), key: key})
+	}
+	for i := 0; i < 10; i++ {
+		if a := wake(); a.status != 202 {
+			t.Fatalf("burst wake %d: %d %s", i+1, a.status, a.body)
+		}
+	}
+	for m := 0; m < 10; m++ {
+		for i := 0; i < 2; i++ {
+			if a := wake(); !a.is(429, "rate_limited") {
+				t.Fatalf("minute %d, early wake %d: %d %s", m, i+1, a.status, a.body)
+			}
+		}
+		g.clk.add(time.Minute)
+		if a := wake(); a.status != 202 {
+			t.Fatalf("minute %d: %d %s", m+1, a.status, a.body)
+		}
+	}
+	if g.count("rate_limited", "scope", "key") != 0 {
+		t.Fatal("a vault within its token's limit met the per-key cap")
+	}
+	if g.fcm.count() != 20 {
+		t.Fatalf("%d sends, want 20", g.fcm.count())
+	}
+}
+
+// A full cache on the wake path: shed with 429, never admitted
+// unrecorded, and nothing is sent for a shed wake.
+func TestFullReplayCacheShedsWakes(t *testing.T) {
+	const max = 32 // one record a shard
+	g := newGW(t, func(g *gw) {
+		g.cfg.Limits.ReplayCacheMax, g.cfg.Limits.Coalesce = max, 0
+		// Limits high enough that only the cache refuses.
+		g.cfg.Limits.TokenPerHour, g.cfg.Limits.TokenBurst = 360000, 100000
+	})
+	key, wb := g.register(fcmReg)
+	g.clk.add(92 * time.Second) // the registration's record is gone
+	const n = 8 * max
+	accepted, shed := 0, 0
+	for i := 0; i < n; i++ {
+		g.clk.add(time.Millisecond)
+		switch a := g.do(rawReq{path: pushwire.PathWake, body: pushwire.WakeBody(wb), key: key}); {
+		case a.status == 202:
+			accepted++
+		case a.is(429, "rate_limited") && a.retry == 1:
+			shed++
+		default:
+			t.Fatalf("wake %d: %d %s", i+1, a.status, a.body)
+		}
+	}
+	if got := g.srv.replay.Len(); accepted != got || accepted > max || shed < 6*max || accepted+shed != n {
+		t.Fatalf("%d accepted, %d shed, %d recorded (capacity %d)", accepted, shed, got, max)
+	}
+	if g.fcm.count() != accepted {
+		t.Fatalf("%d sends for %d accepted wakes", g.fcm.count(), accepted)
+	}
+	if g.count("rate_limited", "scope", "replay_cache") != float64(shed) || g.count("rate_limited", "scope", "key") != 0 {
+		t.Error("rate_limited{scope=replay_cache} does not count the shed wakes")
+	}
+	if _, recs := g.srv.perKey.size(); recs != accepted {
+		t.Errorf("the per-key counts hold %d records for %d accepted wakes", recs, accepted)
 	}
 }

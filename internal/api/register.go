@@ -36,7 +36,7 @@ func (s *Server) register(w http.ResponseWriter, r *http.Request) {
 		// 1. Signature and freshness. The replay cache comes after
 		// step 2: until the attestation has verified, the signer is a
 		// stranger.
-		sr, body, e := s.verify(r)
+		sr, body, now, e := s.verify(r)
 		if e != nil {
 			return e
 		}
@@ -52,8 +52,9 @@ func (s *Server) register(w http.ResponseWriter, r *http.Request) {
 			s.m.Count("attestation_failures", dim("reason", reason))
 			return fail(CodeAttestationInvalid)
 		}
-		// The replay cache, now that the key is a vault release's.
-		if e := s.recordReplay(sr); e != nil {
+		// The replay cache, now that the key is a vault release's. It
+		// is recorded whatever the answer from here on.
+		if e := s.recordReplay(sr, now); e != nil {
 			return e
 		}
 		// 3. The body.

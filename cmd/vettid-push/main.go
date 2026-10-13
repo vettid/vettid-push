@@ -30,7 +30,7 @@ import (
 )
 
 // specVersion is the PUSH-GATEWAY version this gateway implements.
-const specVersion = "0.4.1"
+const specVersion = "0.4.5"
 
 // version is stamped at build time (-ldflags "-X main.version=..."); when
 // empty, the VCS revision embedded by the Go toolchain is used.

@@ -6,7 +6,7 @@ Notification service (iOS), so that no vault and no relay ever holds Apple
 or Google credentials. A wake tells the app only "collect from your
 mailbox"; everything else happens on the phone.
 
-- **Protocol:** PUSH-GATEWAY **0.4.1** (`docs/PUSH-GATEWAY.md` in
+- **Protocol:** PUSH-GATEWAY **0.4.5** (`docs/PUSH-GATEWAY.md` in
   [vettid.org](https://github.com/vettid/vettid.org)), reported by
   `vettid-push -version`. The vault's side is VAULT-MESSAGING §14.
 - **Only caller:** a VettID vault. The gateway is tested against the
@@ -257,8 +257,9 @@ Errors are `{code, message, retry_after?}`: `401 signature_invalid`,
 
 ## Spec interpretation notes
 
-Points where PUSH-GATEWAY 0.4.1 leaves a choice or is silent, and what
-this implementation does:
+Points where PUSH-GATEWAY 0.4.1 left a choice or was silent, and what
+this implementation does. The specification has since written each of
+them down (0.4.2 to 0.4.5):
 
 1. **A token that outgrows the blob.** §5.1 allows a 4,096-byte FCM token
    of any printable ASCII; §4 caps a blob at 6,144 bytes. A token made

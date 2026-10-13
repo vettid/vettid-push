@@ -483,7 +483,14 @@ func TestFullReplayCacheShedsWakes(t *testing.T) {
 		g.cfg.Limits.TokenPerHour, g.cfg.Limits.TokenBurst = 360000, 100000
 	})
 	key, wb := g.register(fcmReg)
-	g.clk.add(92 * time.Second) // the registration's record is gone
+	// The registration's record expires. Sweep it out: an expired
+	// record otherwise stays in its shard, and in Len, until a request
+	// happens to fall in that shard.
+	g.clk.add(92 * time.Second)
+	g.srv.Sweep()
+	if n := g.srv.replay.Len(); n != 0 {
+		t.Fatalf("%d records after the sweep", n)
+	}
 	const n = 8 * max
 	accepted, shed := 0, 0
 	for i := 0; i < n; i++ {
@@ -508,5 +515,47 @@ func TestFullReplayCacheShedsWakes(t *testing.T) {
 	}
 	if _, recs := g.srv.perKey.size(); recs != accepted {
 		t.Errorf("the per-key counts hold %d records for %d accepted wakes", recs, accepted)
+	}
+}
+
+// A key at its cap is told when the FIRST of its records expires, which
+// is when it will be served again, not the last.
+func TestKeyCapRetryAfterIsFirstExpiry(t *testing.T) {
+	g := newGW(t, func(g *gw) { g.cfg.Limits.Coalesce = 0 })
+	limit := replayPerKey(g.cfg.Limits)
+	key, wb := g.register(fcmReg) // a record that expires 91 s from now
+	wake := func() answer {
+		return g.do(rawReq{path: pushwire.PathWake, body: pushwire.WakeBody(wb), key: key})
+	}
+	// The other limit-1 records, two seconds apart: 62 s in all.
+	for i := 1; i < limit; i++ {
+		g.clk.add(2 * time.Second)
+		if a := wake(); a.status != 202 && !a.is(429, "rate_limited") {
+			t.Fatalf("wake %d: %d %s", i, a.status, a.body)
+		}
+	}
+	if g.count("rate_limited", "scope", "key") != 0 {
+		t.Fatal("the cap was met early")
+	}
+	// At the cap. The registration's record has 91 - 62 = 29 s left,
+	// the newest wake's 91 s.
+	a := wake()
+	if !a.is(429, "rate_limited") || a.retry != 29 || a.header.Get("Retry-After") != "29" || g.count("rate_limited", "scope", "key") != 1 {
+		t.Fatalf("at the cap: %d %s", a.status, a.body)
+	}
+	// Just before that record expires the key is still refused; once
+	// it has, one request is admitted and the key is at its cap again,
+	// now waiting for the first wake's record (2 s later).
+	g.clk.add(29*time.Second - time.Millisecond)
+	if a := wake(); !a.is(429, "rate_limited") || a.retry != 1 || g.count("rate_limited", "scope", "key") != 2 {
+		t.Fatalf("a millisecond early: %d %s", a.status, a.body)
+	}
+	g.clk.add(time.Millisecond)
+	wake()
+	if g.count("rate_limited", "scope", "key") != 2 {
+		t.Fatal("still refused at the cap once the first record had expired")
+	}
+	if a := wake(); !a.is(429, "rate_limited") || a.retry != 2 || g.count("rate_limited", "scope", "key") != 3 {
+		t.Fatalf("at the cap again: %d %s", a.status, a.body)
 	}
 }

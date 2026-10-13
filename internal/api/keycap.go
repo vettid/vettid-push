@@ -33,10 +33,13 @@ func replayPerKey(l Limits) int {
 
 // keyRecords counts each key's live replay records, so that one key
 // cannot fill the replay cache for everyone. It holds one expiry per
-// record the replay cache accepted and nothing else: its size is
-// bounded by the replay cache's, and a key enters it only with a
-// record, that is after the check that binds the key to a registration.
-// A stranger's key never reaches it.
+// record the replay cache accepted and nothing else. Its bound is the
+// cap itself: at most max expiries for each key, and only for keys that
+// passed the check that binds a key to a registration, since a key
+// enters it only with a record. A stranger's key never reaches it.
+// (It follows the replay cache but is not always a subset of it:
+// between sweeps it can still hold an expired expiry whose record the
+// cache has already evicted; such an expiry is not counted.)
 type keyRecords struct {
 	mu  sync.Mutex
 	max int

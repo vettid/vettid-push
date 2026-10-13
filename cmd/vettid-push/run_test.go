@@ -533,7 +533,7 @@ func TestHealthcheckCommand(t *testing.T) {
 	if code := runHealthcheck(config.Config{ListenAddr: ":" + port}); code != 1 {
 		t.Fatalf("no gateway: exit %d", code)
 	}
-	if !strings.Contains(buildVersion(), "PUSH-GATEWAY 0.4.1") {
+	if !strings.Contains(buildVersion(), "PUSH-GATEWAY 0.4.5") {
 		t.Fatal(buildVersion())
 	}
 }

@@ -7,6 +7,7 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"strconv"
 	"time"
 )
 
@@ -49,6 +50,24 @@ func FCMPayload(token string) []byte {
 	m.Message.Android.Priority = "HIGH"
 	m.Message.Android.CollapseKey = "w"
 	m.Message.Android.TTL = "86400s"
+	return encodeFCM(m)
+}
+
+// FCMChallengePayload returns the request body of a registration's token
+// challenge (§6): a data message whose only member is the code, under
+// its own collapse key, kept by Google no longer than the challenge is
+// valid.
+func FCMChallengePayload(token, code string) []byte {
+	var m fcmMessage
+	m.Message.Token = token
+	m.Message.Data = map[string]string{"c": code}
+	m.Message.Android.Priority = "HIGH"
+	m.Message.Android.CollapseKey = "c"
+	m.Message.Android.TTL = strconv.Itoa(int(ChallengeLife/time.Second)) + "s"
+	return encodeFCM(m)
+}
+
+func encodeFCM(m fcmMessage) []byte {
 	var b bytes.Buffer
 	enc := json.NewEncoder(&b)
 	enc.SetEscapeHTML(false)
@@ -103,8 +122,15 @@ func (c *FCMClient) send(ctx context.Context, m Message) Result {
 	if base == "" {
 		base = DefaultFCMBaseURL
 	}
+	payload := FCMPayload(m.Token)
+	if m.Challenge != "" {
+		if !challengeCode(m.Challenge) {
+			return Result{Outcome: Rejected, Detail: "request"}
+		}
+		payload = FCMChallengePayload(m.Token, m.Challenge)
+	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost,
-		base+"/v1/projects/"+url.PathEscape(c.Project)+"/messages:send", bytes.NewReader(FCMPayload(m.Token)))
+		base+"/v1/projects/"+url.PathEscape(c.Project)+"/messages:send", bytes.NewReader(payload))
 	if err != nil {
 		return Result{Outcome: Rejected, Detail: "request"}
 	}

@@ -71,12 +71,17 @@ func TestSpecVector(t *testing.T) {
 		}})
 	}
 	a := send(nsmtest.Header(doc))
-	if a.status != 201 {
+	pending, ok := parsePending(a)
+	if !ok {
 		t.Fatalf("the vector's request: %d %s", a.status, a.body)
 	}
-	wb, err := pushwire.ParseRegistered([]byte(a.body))
-	if err != nil {
-		t.Fatalf("201 body %s: %v", a.body, err)
+	if rec, code, err := g.cfg.Keys.OpenPending(pending); err != nil || code != g.code(reg) || !bytes.Equal(rec.Key, pub) {
+		t.Fatalf("pending registration: %v", err)
+	}
+	c := g.confirm(key, pending, g.code(reg))
+	wb, err := pushwire.ParseRegistered([]byte(c.body))
+	if c.status != 201 || err != nil {
+		t.Fatalf("confirmation %d %s: %v", c.status, c.body, err)
 	}
 	rec, current, err := g.cfg.Keys.Open(wb)
 	if err != nil || !current {

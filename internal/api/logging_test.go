@@ -42,11 +42,17 @@ func TestLogAndMetricsCarryNoRequestData(t *testing.T) {
 		doc, _ := g.nsm.Attest(d[:], nil, key.Public().(ed25519.PublicKey))
 		hdr := nsmtest.Header(doc)
 		a := g.do(rawReq{path: pushwire.PathRegister, body: body, key: key, at: at, attest: &hdr, xff: addr})
-		if a.status != 201 {
+		pending, ok := parsePending(a)
+		if !ok {
 			t.Fatalf("register: %d %s", a.status, a.body)
 		}
-		wb, _ := pushwire.ParseRegistered([]byte(a.body))
-		note(wb, hdr, base64.StdEncoding.EncodeToString(key.Public().(ed25519.PublicKey)),
+		code := g.code(reg)
+		c := g.do(rawReq{path: PathConfirm, body: confirmBody(pending, code), key: key, xff: addr})
+		if c.status != 201 {
+			t.Fatalf("confirm: %d %s", c.status, c.body)
+		}
+		wb, _ := pushwire.ParseRegistered([]byte(c.body))
+		note(wb, pending, code, hdr, base64.StdEncoding.EncodeToString(key.Public().(ed25519.PublicKey)),
 			base64.StdEncoding.EncodeToString(key.Seed()), base64.StdEncoding.EncodeToString(doc[:60]))
 		return key, wb
 	}
@@ -80,6 +86,14 @@ func TestLogAndMetricsCarryNoRequestData(t *testing.T) {
 	g.do(rawReq{path: pushwire.PathRegister, body: fcmReg.Body(), key: newKey(t), attest: str(""), xff: addr})         // unattested
 	g.do(rawReq{path: pushwire.PathRegister, body: fcmReg.Body(), key: newKey(t), attest: str("Zm9yZ2Vk"), xff: addr}) // forged
 	g.do(rawReq{path: pushwire.PathRegister, body: []byte(`{"platform":"fcm","token":"` + fcmReg.Token + `","app_id":"com.example.other"}`), key: newKey(t), xff: addr})
+	{ // a confirmation with the wrong code, and one by another signer
+		k := newKey(t)
+		g.clk.add(3 * time.Second)
+		p := g.registerPending(k, fcmReg)
+		g.do(rawReq{path: PathConfirm, body: confirmBody(p, "wrong-code"), key: k, xff: addr})
+		g.do(rawReq{path: PathConfirm, body: confirmBody(p, g.code(fcmReg)), key: newKey(t), xff: addr})
+		note(p, g.code(fcmReg))
+	}
 	wake(ak, fb)     // another signer
 	wake(fk, "AAAA") // garbage blob
 	g.fcm.set(provider.Result{Outcome: provider.TokenGone, Detail: "UNREGISTERED"})
@@ -147,13 +161,14 @@ func TestLogAndMetricsCarryNoRequestData(t *testing.T) {
 		t.Fatal(err)
 	}
 	names := map[string]bool{"registrations": true, "wakes": true, "provider_latency_ms": true,
-		"attestation_failures": true, "rate_limited": true, "blob_resealed": true}
+		"attestation_failures": true, "rate_limited": true, "blob_resealed": true,
+		"challenges": true, "confirmations": true, "blob_expired": true}
 	dims := map[string]*regexp.Regexp{
 		"platform":    regexp.MustCompile(`^(fcm|apns|unknown)$`),
 		"environment": regexp.MustCompile(`^(production|sandbox|none)$`),
 		"outcome":     regexp.MustCompile(`^[a-z_]{2,32}$`),
 		"reason":      regexp.MustCompile(`^[a-z0-9_]{2,32}$`),
-		"scope":       regexp.MustCompile(`^(token|address_register|address_wake|replay_cache|key)$`),
+		"scope":       regexp.MustCompile(`^(token|address_register|address_wake|replay_cache|key|challenge|address_confirm)$`),
 	}
 	seen := map[string]bool{}
 	for _, l := range logLines(mbuf.String()) {
@@ -181,7 +196,8 @@ func TestLogAndMetricsCarryNoRequestData(t *testing.T) {
 			}
 		}
 	}
-	for _, n := range []string{"registrations", "wakes", "provider_latency_ms", "attestation_failures", "rate_limited"} {
+	for _, n := range []string{"registrations", "wakes", "provider_latency_ms", "attestation_failures", "rate_limited",
+		"challenges", "confirmations"} {
 		if !seen[n] {
 			t.Errorf("metric %s was not written", n)
 		}

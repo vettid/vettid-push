@@ -19,12 +19,15 @@ import (
 // internal/pushtest in the dev stack and serves the same control API.
 //
 // DEV ONLY: a recorded wake keeps the SHA-256 of its token, which a
-// release gateway never keeps. A Dev exists only under -dev.
+// release gateway never keeps, and a recorded challenge keeps its code,
+// so that a test playing the app can hand it to its vault. A Dev exists
+// only under -dev.
 type Dev struct {
 	now func() time.Time
 
 	mu       sync.Mutex
 	wakes    []DevWake
+	chals    []DevChallenge
 	regs     int
 	failures []DevFailure
 	reseal   int
@@ -41,6 +44,17 @@ type DevWake struct {
 	AppID       string    `json:"app_id"`
 	TokenSHA256 string    `json:"token_sha256"`
 	Class       string    `json:"class"`
+}
+
+// DevChallenge is one recorded registration challenge: the push the
+// gateway would have sent to the token (§5.1), with its code.
+type DevChallenge struct {
+	At          time.Time `json:"at"`
+	Platform    string    `json:"platform"`
+	Environment string    `json:"environment,omitempty"`
+	AppID       string    `json:"app_id"`
+	TokenSHA256 string    `json:"token_sha256"`
+	Code        string    `json:"code"`
 }
 
 // DevFailure is an injected answer for the next wake(s).
@@ -67,10 +81,18 @@ func (d *Dev) bump() {
 }
 
 // Send implements provider.Provider: it records the wake, or answers
-// with the next injected failure.
+// with the next injected failure. A registration's challenge is always
+// recorded; injected failures answer wakes only.
 func (d *Dev) Send(_ context.Context, m provider.Message) provider.Result {
 	d.mu.Lock()
 	defer d.mu.Unlock()
+	th := sha256.Sum256([]byte(m.Token))
+	if m.Challenge != "" {
+		d.chals = append(d.chals, DevChallenge{At: d.now().UTC(), Platform: m.Platform, Environment: m.Environment,
+			AppID: m.AppID, TokenSHA256: hex.EncodeToString(th[:]), Code: m.Challenge})
+		d.bump()
+		return provider.Result{Outcome: provider.Sent}
+	}
 	if len(d.failures) > 0 {
 		f := &d.failures[0]
 		o := &provider.Override{Status: f.Status, Code: f.Code, RetryAfter: f.RetryAfter}
@@ -79,24 +101,23 @@ func (d *Dev) Send(_ context.Context, m provider.Message) provider.Result {
 		}
 		return provider.Result{Outcome: provider.Rejected, Override: o}
 	}
-	th := sha256.Sum256([]byte(m.Token))
 	d.wakes = append(d.wakes, DevWake{At: d.now().UTC(), Platform: m.Platform, Environment: m.Environment,
 		AppID: m.AppID, TokenSHA256: hex.EncodeToString(th[:]), Class: "notify"})
 	d.bump()
 	return provider.Result{Outcome: provider.Sent}
 }
 
-// note counts a finished request: a registration, or a refusal by
-// "op:code".
+// note counts a finished request: a completed registration (a
+// confirmation that issued a wake blob), or a refusal by "op:code".
 func (d *Dev) note(op string, e *apiError) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	switch {
 	case e != nil:
 		d.refusals[op+":"+e.code]++
-	case op == "register":
+	case op == "confirm":
 		d.regs++
-	default:
+	default: // a registration's challenge is recorded by Send
 		return
 	}
 	d.bump()
@@ -127,7 +148,15 @@ func (d *Dev) Wakes() []DevWake {
 	return append([]DevWake{}, d.wakes...)
 }
 
-// Registrations returns how many registrations succeeded.
+// Challenges returns the recorded registration challenges.
+func (d *Dev) Challenges() []DevChallenge {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	return append([]DevChallenge{}, d.chals...)
+}
+
+// Registrations returns how many registrations completed (a wake blob
+// was issued).
 func (d *Dev) Registrations() int {
 	d.mu.Lock()
 	defer d.mu.Unlock()
@@ -173,7 +202,7 @@ func (d *Dev) ResealNext(n int) {
 // blob key stays, so registered vaults keep working).
 func (d *Dev) Reset() {
 	d.mu.Lock()
-	d.wakes, d.regs, d.failures, d.reseal, d.resealed = nil, 0, nil, 0, nil
+	d.wakes, d.chals, d.regs, d.failures, d.reseal, d.resealed = nil, nil, 0, nil, 0, nil
 	d.refusals = map[string]int{}
 	d.bump()
 	d.mu.Unlock()
@@ -218,7 +247,8 @@ func validCode(s string) bool {
 // test network only; it is not part of the gateway's API.
 //
 //	GET  /dev/push        {registrations, wakes: [{at, platform, environment?, app_id,
-//	                      token_sha256, class}], refusals: {"op:code": n}}
+//	                      token_sha256, class}], challenges: [{at, platform, environment?,
+//	                      app_id, token_sha256, code}], refusals: {"op:code": n}}
 //	POST /dev/push/fail   {status, code, retry_after?, count?}: the next count wakes
 //	                      (default 1) are answered with that error instead of recorded
 //	POST /dev/push/reseal {count?}: the next count wakes answer with a reseal
@@ -227,7 +257,8 @@ func validCode(s string) bool {
 //	                      N wakes are recorded; 404 {"error": "timeout"} otherwise
 func (d *Dev) ControlHandler() http.Handler {
 	state := func() map[string]any {
-		return map[string]any{"registrations": d.Registrations(), "wakes": d.Wakes(), "refusals": d.Refusals()}
+		return map[string]any{"registrations": d.Registrations(), "wakes": d.Wakes(), "challenges": d.Challenges(),
+			"refusals": d.Refusals()}
 	}
 	bad := func(w http.ResponseWriter) { writeJSON(w, 400, map[string]any{"error": "bad_request"}) }
 	mux := http.NewServeMux()

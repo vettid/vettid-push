@@ -24,9 +24,11 @@ import (
 	"testing"
 	"time"
 
+	"github.com/vettid/vettid-relay/relayauth"
 	"github.com/vettid/vettid-vault/vms/manifest"
 	"github.com/vettid/vettid-vault/vms/pushwire"
 
+	"github.com/vettid/vettid-push/internal/api"
 	"github.com/vettid/vettid-push/internal/attest"
 	"github.com/vettid/vettid-push/internal/blob"
 	"github.com/vettid/vettid-push/internal/config"
@@ -96,6 +98,75 @@ func (x xff) RoundTrip(r *http.Request) (*http.Response, error) {
 	r = r.Clone(r.Context())
 	r.Header.Set("X-Forwarded-For", x.addr)
 	return x.next.RoundTrip(r)
+}
+
+// registerBoth registers r in both steps of PUSH-GATEWAY §5.1, signed
+// as the vault's client signs: POST /v1/register with the attestation,
+// then POST /v1/confirm with the code the phone received, which code
+// reads from the fake platform. It returns the wake blob.
+func registerBoth(t *testing.T, hc *http.Client, base string, attester func(ed25519.PublicKey, [32]byte) ([]byte, error),
+	key ed25519.PrivateKey, r pushwire.Registration, code func() string) string {
+	t.Helper()
+	post := func(path string, body []byte, attest bool) (int, []byte) {
+		req, _ := http.NewRequest(http.MethodPost, base+path, bytes.NewReader(body))
+		bh := relayauth.BodyHash(body)
+		relayauth.SetHeaders(req.Header, key, http.MethodPost, path, time.Now(), bh)
+		if attest {
+			d := relayauth.Digest(http.MethodPost, path, req.Header.Get(relayauth.HeaderTimestamp), bh)
+			doc, err := attester(key.Public().(ed25519.PublicKey), d)
+			if err != nil {
+				t.Fatal(err)
+			}
+			req.Header.Set(pushwire.HeaderAttestation, base64.StdEncoding.EncodeToString(doc))
+		}
+		resp, err := hc.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer resp.Body.Close()
+		b, _ := io.ReadAll(resp.Body)
+		return resp.StatusCode, b
+	}
+	st, b := post(pushwire.PathRegister, r.Body(), true)
+	var p struct {
+		Pending string `json:"pending"`
+	}
+	if st != http.StatusAccepted || json.Unmarshal(b, &p) != nil || p.Pending == "" {
+		t.Fatalf("register: %d %s", st, b)
+	}
+	cb, _ := json.Marshal(map[string]string{"pending": p.Pending, "code": code()})
+	st, b = post(api.PathConfirm, cb, false)
+	wb, err := pushwire.ParseRegistered(b)
+	if st != http.StatusCreated || err != nil {
+		t.Fatalf("confirm: %d %s", st, b)
+	}
+	return wb
+}
+
+// lastCode reads the challenge code of the last request a fake platform
+// received: FCM's data member "c", or the top-level "c" of APNs.
+func lastCode(t *testing.T, f *fakePlatform) func() string {
+	return func() string {
+		t.Helper()
+		reqs := f.all()
+		if len(reqs) == 0 {
+			t.Fatal("no challenge was sent")
+		}
+		var v struct {
+			C       string `json:"c"`
+			Message struct {
+				Data map[string]string `json:"data"`
+			} `json:"message"`
+		}
+		_ = json.Unmarshal([]byte(reqs[len(reqs)-1].body), &v)
+		if c := v.Message.Data["c"]; c != "" {
+			return c
+		}
+		if v.C == "" {
+			t.Fatalf("the last request was no challenge: %s", reqs[len(reqs)-1].body)
+		}
+		return v.C
+	}
 }
 
 // started runs the gateway in the background and returns its addresses
@@ -233,8 +304,8 @@ func TestStagingEndToEnd(t *testing.T) {
 
 	// The vault: its client, attesting through the (fake) NSM as the
 	// enclave's supervisor does, behind the load balancer's hop.
-	vault := &pushwire.Client{BaseURL: "http://" + pub, Attest: nsm.Attester(),
-		HTTP: &http.Client{Transport: xff{lbHop, http.DefaultTransport}, Timeout: 10 * time.Second}}
+	vaultHTTP := &http.Client{Transport: xff{lbHop, http.DefaultTransport}, Timeout: 10 * time.Second}
+	vault := &pushwire.Client{BaseURL: "http://" + pub, Attest: nsm.Attester(), HTTP: vaultHTTP}
 	ctx := context.Background()
 	newKey := func() ed25519.PrivateKey { _, k, _ := ed25519.GenerateKey(rand.Reader); return k }
 
@@ -252,23 +323,24 @@ func TestStagingEndToEnd(t *testing.T) {
 	// Android: register, wake.
 	const fcmToken = "eXaMpLe-fcm:APA91bE2E_registration-token"
 	fcmKey := newKey()
-	fcmBlob, err := vault.Register(ctx, fcmKey, pushwire.Registration{Platform: "fcm", Token: fcmToken, AppID: "com.vettid.app.staging"})
-	if err != nil {
-		t.Fatalf("fcm register: %v", err)
-	}
-	if len(google.all()) != 0 {
-		t.Fatal("registering contacted Google")
-	}
+	fcmCode := ""
+	fcmBlob := registerBoth(t, vaultHTTP, "http://"+pub, nsm.Attester(), fcmKey,
+		pushwire.Registration{Platform: "fcm", Token: fcmToken, AppID: "com.vettid.app.staging"},
+		func() string { fcmCode = lastCode(t, google)(); return fcmCode })
 	if reseal, err := vault.Wake(ctx, fcmKey, fcmBlob); err != nil || reseal != "" {
 		t.Fatalf("fcm wake: %q %v", reseal, err)
 	}
 	greqs := google.all()
-	if len(greqs) != 2 || greqs[0].path != "/token" || greqs[1].path != "/v1/projects/vettid-staging/messages:send" {
+	if len(greqs) != 3 || greqs[0].path != "/token" || greqs[1].path != "/v1/projects/vettid-staging/messages:send" ||
+		greqs[2].path != greqs[1].path {
 		t.Fatalf("Google saw %d requests: %+v", len(greqs), greqs)
 	}
-	if greqs[1].header.Get("Authorization") != "Bearer ya29.e2e-access-token" ||
-		greqs[1].body != `{"message":{"token":"`+fcmToken+`","data":{"w":"1"},"android":{"priority":"HIGH","collapse_key":"w","ttl":"86400s"}}}` {
-		t.Fatalf("FCM request: %s", greqs[1].body)
+	if greqs[1].body != `{"message":{"token":"`+fcmToken+`","data":{"c":"`+fcmCode+`"},"android":{"priority":"HIGH","collapse_key":"c","ttl":"600s"}}}` {
+		t.Fatalf("FCM challenge: %s", greqs[1].body)
+	}
+	if greqs[2].header.Get("Authorization") != "Bearer ya29.e2e-access-token" ||
+		greqs[2].body != `{"message":{"token":"`+fcmToken+`","data":{"w":"1"},"android":{"priority":"HIGH","collapse_key":"w","ttl":"86400s"}}}` {
+		t.Fatalf("FCM request: %s", greqs[2].body)
 	}
 
 	// iOS: a development build (sandbox) and a TestFlight build
@@ -279,18 +351,21 @@ func TestStagingEndToEnd(t *testing.T) {
 		fake *fakePlatform
 	}{{"sandbox", apnsSand}, {"production", apnsProd}} {
 		k := newKey()
-		b, err := vault.Register(ctx, k, pushwire.Registration{Platform: "apns", Token: apnsToken, AppID: "com.vettid.app.staging", Environment: c.env})
-		if err != nil {
-			t.Fatalf("apns %s register: %v", c.env, err)
-		}
+		b := registerBoth(t, vaultHTTP, "http://"+pub, nsm.Attester(), k,
+			pushwire.Registration{Platform: "apns", Token: apnsToken, AppID: "com.vettid.app.staging", Environment: c.env},
+			lastCode(t, c.fake))
 		if _, err := vault.Wake(ctx, k, b); err != nil {
 			t.Fatalf("apns %s wake: %v", c.env, err)
 		}
 		reqs := c.fake.all()
-		if len(reqs) != 1 {
+		if len(reqs) != 2 {
 			t.Fatalf("apns %s: %d requests", c.env, len(reqs))
 		}
-		r := reqs[0]
+		if ch := reqs[0]; ch.header.Get("apns-push-type") != "background" || ch.header.Get("apns-priority") != "5" ||
+			!strings.HasPrefix(ch.body, `{"aps":{"content-available":1},"c":"`) {
+			t.Fatalf("apns %s challenge: %v %s", c.env, ch.header, ch.body)
+		}
+		r := reqs[1]
 		if r.proto != 2 || r.path != "/3/device/"+apnsToken || r.header.Get("apns-topic") != "com.vettid.app.staging" ||
 			r.header.Get("apns-push-type") != "alert" || r.header.Get("apns-priority") != "10" ||
 			r.body != `{"aps":{"alert":{"loc-key":"WAKE_FALLBACK"},"mutable-content":1,"sound":"default"}}` {
@@ -370,6 +445,7 @@ func TestStagingEndToEnd(t *testing.T) {
 	}
 	for name, s := range map[string]string{
 		"the FCM token": fcmToken, "the APNs token": apnsToken, "a wake blob": fcmBlob, "a wake blob's start": fcmBlob[:24],
+		"a challenge code":        fcmCode,
 		"the wake key":            base64.StdEncoding.EncodeToString(fcmKey.Public().(ed25519.PublicKey)),
 		"the source address":      lbHop,
 		"the access token":        "ya29.e2e-access-token",
@@ -406,10 +482,25 @@ func TestDevStandIn(t *testing.T) {
 	vault := &pushwire.Client{BaseURL: "http://" + pub, Attest: nsm.Attester()}
 	ctx := context.Background()
 	_, key, _ := ed25519.GenerateKey(rand.Reader)
-	wb, err := vault.Register(ctx, key, pushwire.Registration{Platform: "fcm", Token: "dev-token", AppID: "com.vettid.app.dev"})
-	if err != nil {
-		t.Fatalf("register: %v", err)
-	}
+	wb := registerBoth(t, http.DefaultClient, "http://"+pub, nsm.Attester(), key,
+		pushwire.Registration{Platform: "fcm", Token: "dev-token", AppID: "com.vettid.app.dev"}, func() string {
+			// The dev stack, playing the app, reads the code from the
+			// control routes.
+			resp, err := http.Get("http://" + ctl + "/dev/push")
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer resp.Body.Close()
+			var st struct {
+				Challenges []struct {
+					Code string `json:"code"`
+				} `json:"challenges"`
+			}
+			if json.NewDecoder(resp.Body).Decode(&st) != nil || len(st.Challenges) != 1 {
+				t.Fatalf("challenges: %+v", st)
+			}
+			return st.Challenges[0].Code
+		})
 	if _, err := vault.Wake(ctx, key, wb); err != nil {
 		t.Fatalf("wake: %v", err)
 	}

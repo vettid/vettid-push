@@ -265,3 +265,48 @@ func TestKeyringSecret(t *testing.T) {
 		t.Fatal("error text carries key material")
 	}
 }
+
+// A pending registration (§5.1) is sealed with the same keys under its
+// own associated data: it opens only as a pending registration, with its
+// code, and a wake blob never opens as one, nor a record with a code as
+// a wake blob even under the blob's associated data.
+func TestPending(t *testing.T) {
+	sec, raw := secretOf(t, "0a0b0c0d")
+	k := ring(t, "staging", sec)
+	rec := Record{Platform: "fcm", AppID: "com.vettid.app", Token: "tok", Key: testKey(t), Issued: 1781092800}
+	p, err := k.SealPending(rec, "q3Zl0-Yc_w7Tj2b1d9KfAA")
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, code, err := k.OpenPending(p)
+	if err != nil || code != "q3Zl0-Yc_w7Tj2b1d9KfAA" || got.Token != rec.Token || !bytes.Equal(got.Key, rec.Key) || got.Issued != rec.Issued {
+		t.Fatalf("open pending: %+v %q %v", got, code, err)
+	}
+	if _, _, err := k.Open(p); !errors.Is(err, ErrInvalid) {
+		t.Fatal("a pending registration opened as a wake blob")
+	}
+	wb, err := k.Seal(rec)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := k.OpenPending(wb); !errors.Is(err, ErrInvalid) {
+		t.Fatal("a wake blob opened as a pending registration")
+	}
+	if _, err := k.SealPending(rec, ""); !errors.Is(err, ErrInvalid) {
+		t.Fatal("a pending registration without a code")
+	}
+	if _, _, err := ring(t, "prod", sec).OpenPending(p); !errors.Is(err, ErrInvalid) {
+		t.Fatal("a staging pending registration opened in production")
+	}
+	// A record carrying a code, sealed by hand under the blob's own
+	// associated data, is still no wake blob.
+	aead, _ := chacha20poly1305.NewX(raw["0a0b0c0d"])
+	pt := []byte(`{"p":"fcm","a":"com.vettid.app","t":"tok","k":"` + base64.StdEncoding.EncodeToString(rec.Key) + `","i":1,"c":"x"}`)
+	out := []byte{Version, 0x0a, 0x0b, 0x0c, 0x0d}
+	nonce := make([]byte, chacha20poly1305.NonceSizeX)
+	out = append(out, nonce...)
+	out = aead.Seal(out, nonce, pt, []byte("vettid/push/1/blob\x00staging"))
+	if _, _, err := k.Open(base64.RawURLEncoding.EncodeToString(out)); !errors.Is(err, ErrInvalid) {
+		t.Fatal("a record with a code opened as a wake blob")
+	}
+}

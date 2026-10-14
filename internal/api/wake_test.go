@@ -315,7 +315,7 @@ func TestWakeReseal(t *testing.T) {
 	oldRec, _, _ := g.cfg.Keys.Open(old)
 	_, oldID := g.cfg.Keys.KeyIDs()
 
-	g.clk.add(400 * 24 * time.Hour) // a year on: the key is rotated
+	g.clk.add(30 * 24 * time.Hour) // a month on: the key is rotated
 	rotated, err := blob.RotateSecret(g.secret)
 	if err != nil {
 		t.Fatal(err)

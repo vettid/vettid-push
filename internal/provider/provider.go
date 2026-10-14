@@ -1,7 +1,9 @@
 // Package provider sends the gateway's fixed, content-free wake payloads
 // to the platform push services (PUSH-GATEWAY §6) and maps their answers
 // to the gateway's outcomes (§7): Firebase Cloud Messaging (HTTP v1) and
-// the Apple Push Notification service (HTTP/2, token-based auth).
+// the Apple Push Notification service (HTTP/2, token-based auth). It
+// also sends a registration's token challenge (§5.1, §6): a silent push
+// whose only variable part is the random challenge code.
 //
 // Nothing in this package logs. Errors and results never carry a push
 // token, a credential or a platform's message text: Result.Detail is
@@ -31,13 +33,23 @@ const SendTimeout = 5 * time.Second
 // value, §7).
 const MaxRetryAfter = 3600
 
+// ChallengeLife is how long a registration's token challenge is valid
+// (§5.1): the platform is told to drop the challenge push after it, and
+// the gateway refuses its pending registration after it.
+const ChallengeLife = 10 * time.Minute
+
 // Message is one wake: where to send the fixed payload. It carries
-// nothing else, because a wake has no content (§1).
+// nothing else, because a wake has no content (§1). With Challenge set
+// it is a registration's token challenge instead: the silent challenge
+// payload carrying that code and nothing else.
 type Message struct {
 	Platform    string
 	Environment string // apns only
 	AppID       string
 	Token       string
+	// Challenge is the random challenge code of a registration (§5.1);
+	// empty for a wake.
+	Challenge string
 }
 
 // Outcome is what the platform made of a send.
@@ -145,4 +157,20 @@ func pick(s string, set []string, other string) string {
 		}
 	}
 	return other
+}
+
+// challengeCode reports whether s can be a challenge code: 1-64
+// characters of base64url. The gateway makes the codes itself; this
+// keeps anything else out of a payload.
+func challengeCode(s string) bool {
+	if len(s) == 0 || len(s) > 64 {
+		return false
+	}
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		if !(c >= 'A' && c <= 'Z' || c >= 'a' && c <= 'z' || c >= '0' && c <= '9' || c == '-' || c == '_') {
+			return false
+		}
+	}
+	return true
 }

@@ -54,6 +54,12 @@ func TestDevStandIn(t *testing.T) {
 	if st != 200 || state["registrations"] != float64(1) {
 		t.Fatalf("state: %d %v", st, state)
 	}
+	// The registration's challenge is recorded with its code, for the
+	// dev stack to hand to its vault as the app would.
+	if ch := state["challenges"].([]any); len(ch) != 1 || ch[0].(map[string]any)["code"] != g.code(reg) ||
+		ch[0].(map[string]any)["app_id"] != "org.example.anything" {
+		t.Fatalf("challenges: %v", state["challenges"])
+	}
 	wakes := state["wakes"].([]any)
 	th := sha256.Sum256([]byte(reg.Token))
 	w := wakes[0].(map[string]any)
@@ -139,7 +145,8 @@ func TestDevStandIn(t *testing.T) {
 		t.Fatal(st)
 	}
 	_, state = call("GET", "/dev/push", "")
-	if state["registrations"] != float64(0) || len(state["wakes"].([]any)) != 0 || len(state["refusals"].(map[string]any)) != 0 {
+	if state["registrations"] != float64(0) || len(state["wakes"].([]any)) != 0 || len(state["refusals"].(map[string]any)) != 0 ||
+		len(state["challenges"].([]any)) != 0 {
 		t.Fatalf("after reset: %v", state)
 	}
 	g.clk.add(3 * time.Second)

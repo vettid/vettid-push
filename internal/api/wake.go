@@ -45,6 +45,13 @@ func (s *Server) wake(w http.ResponseWriter, r *http.Request) {
 		if err != nil || subtle.ConstantTimeCompare(rec.Key, sr.Key) != 1 {
 			return fail(CodeBlobInvalid)
 		}
+		// A blob older than its maximum age is refused like any other
+		// (§4); the vault registers again, which verifies the token
+		// again. Only the metric tells the cases apart.
+		if now.Sub(time.Unix(rec.Issued, 0)) > BlobMaxAge {
+			s.m.Count("blob_expired")
+			return fail(CodeBlobInvalid)
+		}
 		prov := s.cfg.Providers[rec.Platform]
 		// A record this gateway would no longer seal (a platform or an
 		// app id since removed from the channel) is not sent.

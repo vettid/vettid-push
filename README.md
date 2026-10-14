@@ -217,6 +217,20 @@ The alarms of §10.5 map to: provider auth failures =
 `internal_errors`; manifest refresh failing = `manifest_refresh{outcome=error}`;
 attestation failures = `attestation_failures`.
 
+**Proposed alarm: challenge limit.** `rate_limited{scope=challenge}`
+should raise an alarm (to start with, more than 20 in an hour, summed
+over platforms). A phone's own vault meets the per-token challenge limit
+only when it retries far too often. Steady counts mean someone who knows
+a phone's push token is spending that token's challenges, which keeps
+the real phone from registering and from renewing its blob (a blob
+expires after 90 days, and then the phone is not woken until it
+registers again). The operator's responses are to raise
+`PUSH_RATE_CHALLENGE_PER_HOUR` / `PUSH_RATE_CHALLENGE_BURST` or to block
+the source address at the load balancer. The metric has no dimension
+that names the token, so the alarm tells the operator that this is
+happening, not to whom. The alarm, like the others, is defined in the
+deployment's metric filters (vettid.org), not in this repository.
+
 The "manifest refresh failing" alarm (1 hour) is what keeps the maximum
 manifest age (7 days, below) from ever being reached: left unanswered for
 a week, it ends with every registration refused (wakes go on).

@@ -1,5 +1,5 @@
 // Package api is the push gateway's HTTP surface (PUSH-GATEWAY §5):
-// POST /v1/register, POST /v1/wake and GET /v1/health.
+// POST /v1/register, POST /v1/confirm, POST /v1/wake and GET /v1/health.
 //
 // The gateway stores nothing about a registration: what it needs is
 // sealed into the wake blob it returns, and a wake's opened record lives
@@ -34,6 +34,15 @@ import (
 	"github.com/vettid/vettid-push/internal/ratelimit"
 )
 
+// PathConfirm is the second step of a registration (§5.1): the vault
+// returns the challenge code its app received by push.
+const PathConfirm = "/v1/confirm"
+
+// BlobMaxAge is the longest a wake blob is honoured after it was issued
+// (§4): an older blob is answered blob_invalid, and the vault registers
+// again, which verifies the token again. A reseal keeps the issue time.
+const BlobMaxAge = 90 * 24 * time.Hour
+
 // MaxBody bounds a request body: a registration is a 4 KiB token and
 // little else, a wake a 6 KiB blob (the vault's supervisor sends at most
 // this much).
@@ -48,6 +57,10 @@ type Limits struct {
 	// TokenPerHour and TokenBurst bound the wakes of one push token.
 	TokenPerHour int
 	TokenBurst   int
+	// ChallengePerHour and ChallengeBurst bound the registration
+	// challenges sent to one push token, apart from its wakes.
+	ChallengePerHour int
+	ChallengeBurst   int
 	// Coalesce is the window in which a second wake for a token is
 	// answered without a second send (0: never).
 	Coalesce time.Duration
@@ -58,7 +71,7 @@ type Limits struct {
 // DefaultLimits are the limits of §8.
 func DefaultLimits() Limits {
 	return Limits{RegisterPerMinute: 30, WakePerMinute: 6000, TokenPerHour: 60, TokenBurst: 10,
-		Coalesce: 2 * time.Second, ReplayCacheMax: 200_000}
+		ChallengePerHour: 10, ChallengeBurst: 5, Coalesce: 2 * time.Second, ReplayCacheMax: 200_000}
 }
 
 // Config configures a Server.
@@ -99,8 +112,10 @@ type Server struct {
 	replay  *relayauth.ReplayCache
 	perKey  *keyRecords
 	regAddr *ratelimit.Limiter
+	conAddr *ratelimit.Limiter
 	wakAddr *ratelimit.Limiter
 	token   *ratelimit.Limiter
+	chal    *ratelimit.Limiter
 	coal    *ratelimit.Coalescer
 	macKey  [32]byte
 
@@ -124,15 +139,18 @@ func New(cfg Config) (*Server, error) {
 		cfg.Metrics = metrics.New("vettid-push", cfg.Now)
 	}
 	l := cfg.Limits
-	if l.RegisterPerMinute <= 0 || l.WakePerMinute <= 0 || l.TokenPerHour <= 0 || l.TokenBurst <= 0 || l.ReplayCacheMax <= 0 {
+	if l.RegisterPerMinute <= 0 || l.WakePerMinute <= 0 || l.TokenPerHour <= 0 || l.TokenBurst <= 0 || l.ReplayCacheMax <= 0 ||
+		l.ChallengePerHour <= 0 || l.ChallengeBurst <= 0 {
 		return nil, errors.New("api: limits must be positive")
 	}
 	s := &Server{cfg: cfg, now: cfg.Now, log: cfg.Log, m: cfg.Metrics,
 		replay:  relayauth.NewReplayCache(l.ReplayCacheMax),
 		perKey:  newKeyRecords(replayPerKey(l)),
 		regAddr: ratelimit.New(float64(l.RegisterPerMinute)/60, l.RegisterPerMinute, 0),
+		conAddr: ratelimit.New(float64(l.RegisterPerMinute)/60, l.RegisterPerMinute, 0),
 		wakAddr: ratelimit.New(float64(l.WakePerMinute)/60, l.WakePerMinute, 0),
 		token:   ratelimit.New(float64(l.TokenPerHour)/3600, l.TokenBurst, 1_000_000),
+		chal:    ratelimit.New(float64(l.ChallengePerHour)/3600, l.ChallengeBurst, 1_000_000),
 		coal:    ratelimit.NewCoalescer(l.Coalesce, 1_000_000),
 		logLast: map[string]time.Time{}, logSkip: map[string]int{}}
 	if _, err := rand.Read(s.macKey[:]); err != nil {
@@ -148,8 +166,10 @@ func (s *Server) Sweep() {
 	s.replay.Sweep(now)
 	s.perKey.sweep(now)
 	s.regAddr.Prune(now)
+	s.conAddr.Prune(now)
 	s.wakAddr.Prune(now)
 	s.token.Prune(now)
+	s.chal.Prune(now)
 	s.coal.Prune(now)
 }
 
@@ -170,6 +190,8 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, struct{}{})
 	case r.URL.Path == pushwire.PathRegister && r.Method == http.MethodPost:
 		s.register(w, r)
+	case r.URL.Path == PathConfirm && r.Method == http.MethodPost:
+		s.confirm(w, r)
 	case r.URL.Path == pushwire.PathWake && r.Method == http.MethodPost:
 		s.wake(w, r)
 	default:
@@ -255,7 +277,8 @@ func (s *Server) tokenKey(rec blob.Record) string {
 // request enters the replay cache (recordReplay) only once the handler
 // has established that the key is one the gateway knows: on a wake, the
 // key sealed in a blob of its own; on a registration, the key a vault
-// release attested for this very request.
+// release attested for this very request; on a confirmation, the key
+// sealed in a pending registration of its own.
 //
 // It returns the reading of the clock it judged freshness by, and
 // recordReplay must be given the same one. A record expires one second

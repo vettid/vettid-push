@@ -20,8 +20,17 @@ mailbox"; everything else happens on the phone.
   attestation document; the gateway verifies it against the pinned AWS
   root and admits only the PCR0 of a release that the channel's signed
   release manifest lists as `active` or `deprecated`.
+- **Only for a token the caller's phone holds.** Before a wake blob is
+  issued, the gateway sends a random challenge code to the push token by
+  push; the blob is issued only when the vault returns that code, which
+  only the app holding the token receives (`POST /v1/confirm`). A vault
+  cannot get a blob for a token it merely learned.
+- **Blobs expire.** A wake blob is honoured for **90 days** from its
+  issue, then refused like any invalid blob; the vault registers again.
 - **Fixed payloads.** Every wake of a platform is byte-identical apart
-  from the push token: no message, sender, name, count or cursor.
+  from the push token: no message, sender, name, count or cursor. A
+  registration's challenge is a silent push whose only variable part is
+  the random code.
 - **Stack:** Go standard library `net/http`. The attestation and manifest
   verifiers, the pinned AWS Nitro root and the wire format are the vault's
   own packages (`vettid-vault/vms/nitro`, `vms/manifest`, `vms/pins`,
@@ -42,20 +51,23 @@ PUSH_DEV_PCR0S=<pcr0 hex of the dev release> \
 `-dev` is the **gateway stand-in** of the vault's dev stack (PUSH-GATEWAY
 §10.4): it accepts the dev enclave's test attestation (a test root and a
 list of PCR0s instead of the AWS root and the manifest), and it **records
-wakes instead of sending them**. It has no credentials, makes a random
+wakes and registration challenges instead of sending them**. It has no credentials, makes a random
 blob key at start, and serves the control routes of the vault's
 `internal/pushtest` stand-in on a second listener
 (`PUSH_DEV_CONTROL_ADDR`, loopback by default):
 
 ```
-GET  /dev/push         {registrations, wakes: [{at, platform, environment?, app_id, token_sha256, class}], refusals}
+GET  /dev/push         {registrations, wakes: [{at, platform, environment?, app_id, token_sha256, class}],
+                        challenges: [{at, platform, environment?, app_id, token_sha256, code}], refusals}
 POST /dev/push/fail    {status, code, retry_after?, count?}   answer the next wake(s) with this error
 POST /dev/push/reseal  {count?}                               answer the next wake(s) with a reseal
 POST /dev/push/reset                                          forget wakes, counts and injected answers
 POST /dev/push/wait    {wakes: N, timeout_s}                  wait until N wakes are recorded (404 on timeout)
 ```
 
-`-dev` refuses the channels `prod` and `staging`, refuses
+`registrations` counts completed registrations (a wake blob issued). A
+test playing the app reads a registration's challenge code from
+`challenges` and hands it to its vault. `-dev` refuses the channels `prod` and `staging`, refuses
 `PUSH_SECRETS=aws`, refuses the real AWS Nitro root, seals its blobs for
 the channel `dev` (they open nowhere else), and logs a warning at start.
 The vault's dev stack publishes its test root as `nitro_root` in
@@ -106,6 +118,7 @@ Durations accept Go syntax (`90s`) or a bare integer of seconds.
 | `PUSH_RATE_REGISTER_PER_MINUTE` | `30` | Registrations per source address (§8). |
 | `PUSH_RATE_WAKE_PER_MINUTE` | `6000` | Wakes per source address (§8). |
 | `PUSH_RATE_TOKEN_PER_HOUR` / `PUSH_RATE_TOKEN_BURST` | `60` / `10` | Wakes per push token (§8). |
+| `PUSH_RATE_CHALLENGE_PER_HOUR` / `PUSH_RATE_CHALLENGE_BURST` | `10` / `5` | Registration challenges per push token, counted apart from its wakes. |
 | `PUSH_COALESCE_WINDOW` | `2s` | A wake for a token within this time of the previous one is answered `202` without a second send (§5.2); `0` turns it off. |
 | `PUSH_REPLAY_CACHE_MAX` | `200000` | Replay-cache capacity; when full, requests are shed with `rate_limited`. |
 | `PUSH_DEV_NITRO_ROOT` / `PUSH_DEV_NITRO_ROOT_FILE` | | `-dev` only: the dev enclave's test Nitro root, as base64 DER or as a PEM file. |
@@ -186,12 +199,15 @@ interval, never per request):
 
 | Metric | Dimensions | |
 |---|---|---|
-| `registrations` | `platform`, `outcome` | `outcome`: `ok` or the error code |
+| `registrations` | `platform`, `outcome` | `outcome`: `ok` (the challenge was sent and a pending registration returned) or the error code |
+| `challenges` | `platform`, `outcome` | a registration's challenge send: `sent`, `token_gone`, `token_invalid`, `provider_rate_limited`, `provider_unavailable`, `provider_auth`, `provider_rejected` |
+| `confirmations` | `platform`, `outcome` | `outcome`: `ok` (a wake blob issued) or the error code |
 | `wakes` | `platform`, `environment`, `outcome` | `outcome`: `sent`, `coalesced`, an error code, or `provider_rate_limited`, `provider_unavailable`, `provider_auth`, `provider_rejected` |
 | `provider_latency_ms` | `platform` | up to 100 sampled values per interval |
 | `attestation_failures` | `reason` | `missing`, `malformed`, `chain`, `signature`, `stale`, `public_key`, `user_data`, `pcr0`, `no_manifest`, `manifest_stale` |
-| `rate_limited` | `scope` | `token`, `address_register`, `address_wake`, `replay_cache`, `key` (one key at its cap of live replay records) |
+| `rate_limited` | `scope` | `token`, `address_register`, `address_wake`, `replay_cache`, `key` (one key at its cap of live replay records), `challenge` (a token's challenge limit), `address_confirm` |
 | `blob_resealed` | | |
+| `blob_expired` | | a wake refused because its blob is older than 90 days (answered `blob_invalid`) |
 | `manifest_refresh` | `outcome` | `ok`, `error`, `not_published` (for the "refresh failing" alarm) |
 | `internal_errors` | | every `500 internal` (for the "any internal" alarm) |
 
@@ -214,12 +230,14 @@ All of it is PUSH-GATEWAY §5–§7. Requests are signed per Relay Protocol
 
 | | |
 |---|---|
-| `POST /v1/register` + `X-VettID-Attestation` | `{platform, token, app_id, environment?}` → `201 {wake_blob}` |
+| `POST /v1/register` + `X-VettID-Attestation` | `{platform, token, app_id, environment?}` → `202 {pending}`, after sending a challenge code to the token |
+| `POST /v1/confirm` | `{pending, code}`, signed by the same wake key, within 10 minutes → `201 {wake_blob}` |
 | `POST /v1/wake` | `{wake_blob, class: "notify"}` → `202 {reseal?}` |
 | `GET /v1/health` | `200 {}` (unauthenticated) |
 
 Errors are `{code, message, retry_after?}`: `401 signature_invalid`,
-`timestamp_stale`, `replay_detected`; `403 attestation_invalid`;
+`timestamp_stale`, `replay_detected`; `403 attestation_invalid`,
+`challenge_invalid`;
 `400 bad_request`, `platform_invalid`, `app_invalid`, `token_invalid`;
 `410 token_gone`, `blob_invalid`; `429 rate_limited`;
 `502 provider_unavailable`; `500 internal`. A wait is given in the body's
@@ -240,7 +258,10 @@ Errors are `{code, message, retry_after?}`: `401 signature_invalid`,
   (`internal/api/logging_test.go`, `cmd/vettid-push/run_test.go`).
 - **No oracle.** Every blob that does not open, belongs to another channel
   or another signer, or names a key that is gone is answered with the same
-  `410 blob_invalid`. Every refused attestation is the same `403`.
+  `410 blob_invalid`, an expired one included. Every refused attestation
+  is the same `403`, and so is every refused confirmation (a wrong code,
+  another signer, a pending registration older than 10 minutes or one
+  that does not open): `403 challenge_invalid`.
 - **Fixed error messages.** A message is fixed per code and never repeats
   request content. A platform's own error text is never passed on or
   logged: only its reason code, from a closed list.
@@ -330,6 +351,11 @@ them down (0.4.2 to 0.4.5):
     `platform_invalid`.
 11. **Body errors** are named in the order of §5.1 step 3: platform,
     token, environment (`bad_request`), app id.
+12. **Token verification and the blob's maximum age** are implemented
+    ahead of the specification text, which is proposed alongside: the
+    registration answers `202 {pending}` and sends the challenge, the
+    confirmation issues the blob, and wakes refuse blobs older than 90
+    days.
 
 ## Development
 

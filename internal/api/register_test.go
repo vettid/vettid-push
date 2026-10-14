@@ -18,39 +18,64 @@ import (
 	"github.com/vettid/vettid-push/internal/nsmtest"
 )
 
-// §5.1 with the vault's own client: a registration is answered 201 with
-// a blob that holds the record and the wake key; no platform is
-// contacted; the same body twice yields two blobs that both work.
+// §5.1: a registration is answered 202 with a pending registration and
+// sends a challenge code to the token, and nothing else; the
+// confirmation with that code is answered 201 with a blob that holds the
+// record and the wake key; the same body twice yields two blobs that
+// both work.
 func TestRegister(t *testing.T) {
 	g := newGW(t)
 	for _, reg := range []pushwire.Registration{fcmReg, apnsReg,
 		{Platform: "apns", Token: apnsReg.Token, AppID: "com.vettid.app", Environment: "sandbox"}} {
-		key, wb := g.register(reg)
-		if !pushwire.ValidBlob(wb) {
+		key := newKey(t)
+		pending := g.registerPending(key, reg)
+		if _, _, err := g.cfg.Keys.Open(pending); err == nil {
+			t.Fatal("a pending registration opens as a wake blob")
+		}
+		prov := g.fcm
+		if reg.Platform == "apns" {
+			prov = g.apns
+		}
+		m, ok := prov.lastChallenge(reg.Token)
+		if !ok || m.Platform != reg.Platform || m.Environment != reg.Environment || m.AppID != reg.AppID ||
+			len(m.Challenge) != 22 {
+			t.Fatalf("challenge %+v", m)
+		}
+		if strings.Contains(pending, m.Challenge) {
+			t.Fatal("the pending registration shows the code")
+		}
+		g.clk.add(time.Minute) // the phone answers a minute later
+		a := g.confirm(key, pending, m.Challenge)
+		if a.status != 201 {
+			t.Fatalf("confirm: %d %s", a.status, a.body)
+		}
+		wb, err := pushwire.ParseRegistered([]byte(a.body))
+		if err != nil || !pushwire.ValidBlob(wb) {
 			t.Fatalf("the vault would refuse this blob: %q", wb)
 		}
 		rec, current, err := g.cfg.Keys.Open(wb)
 		if err != nil || !current {
 			t.Fatal(err)
 		}
+		// Its age counts from the confirmation.
 		if rec.Platform != reg.Platform || rec.Environment != reg.Environment || rec.AppID != reg.AppID || rec.Token != reg.Token ||
-			!bytes.Equal(rec.Key, key.Public().(ed25519.PublicKey)) || rec.Issued != t0.Unix() {
+			!bytes.Equal(rec.Key, key.Public().(ed25519.PublicKey)) || rec.Issued != g.clk.now().Unix() {
 			t.Fatalf("record %+v", rec)
 		}
 	}
 	if g.fcm.count()+g.apns.count() != 0 {
-		t.Fatal("registering contacted a platform")
+		t.Fatal("registering sent a wake")
+	}
+	if g.fcm.chalCount() != 1 || g.apns.chalCount() != 2 {
+		t.Fatalf("%d and %d challenges", g.fcm.chalCount(), g.apns.chalCount())
 	}
 	key := newKey(t)
 	g.clk.add(time.Second)
-	a, err := g.vault().Register(context.Background(), key, fcmReg)
-	if err != nil {
-		t.Fatal(err)
-	}
+	a := g.registerWith(key, fcmReg)
 	g.clk.add(time.Second)
-	b, err := g.vault().Register(context.Background(), key, fcmReg)
-	if err != nil || a == b {
-		t.Fatalf("the same body twice: err %v, identical %v", err, a == b)
+	b := g.registerWith(key, fcmReg)
+	if a == b {
+		t.Fatal("the same body twice: identical blobs")
 	}
 	for _, wb := range []string{a, b} {
 		g.clk.add(3 * time.Second)
@@ -60,6 +85,10 @@ func TestRegister(t *testing.T) {
 	}
 	if g.count("registrations", "platform", "fcm", "outcome", "ok") != 3 || g.count("registrations", "platform", "apns", "outcome", "ok") != 2 {
 		t.Fatal("registrations metric")
+	}
+	if g.count("confirmations", "platform", "fcm", "outcome", "ok") != 3 || g.count("confirmations", "platform", "apns", "outcome", "ok") != 2 ||
+		g.count("challenges", "platform", "fcm", "outcome", "sent") != 3 {
+		t.Fatal("confirmations or challenges metric")
 	}
 }
 
@@ -96,7 +125,7 @@ func TestRegisterAuth(t *testing.T) {
 	}
 	// 89 s either way is fresh (the attestation is made now).
 	for _, d := range []time.Duration{-89 * time.Second, 89 * time.Second} {
-		if a := g.do(rawReq{path: pushwire.PathRegister, body: body, key: newKey(t), at: t0.Add(d)}); a.status != 201 {
+		if a := g.do(rawReq{path: pushwire.PathRegister, body: body, key: newKey(t), at: t0.Add(d)}); a.status != 202 {
 			t.Errorf("%v: %d %s", d, a.status, a.body)
 		}
 	}
@@ -111,7 +140,7 @@ func TestRegisterAuth(t *testing.T) {
 			h[k] = v
 		}
 	}}
-	if a := g.do(q); a.status != 201 {
+	if a := g.do(q); a.status != 202 {
 		t.Fatalf("first: %d %s", a.status, a.body)
 	}
 	if a := g.do(q); !a.is(401, "replay_detected") {
@@ -229,7 +258,7 @@ func TestRegisterManifest(t *testing.T) {
 	for i, c := range []struct {
 		status string
 		want   int
-	}{{manifest.StatusActive, 201}, {manifest.StatusDeprecated, 201}, {manifest.StatusRetired, 403}, {manifest.StatusRemoved, 403}} {
+	}{{manifest.StatusActive, 202}, {manifest.StatusDeprecated, 202}, {manifest.StatusRetired, 403}, {manifest.StatusRemoved, 403}} {
 		rel := []manifest.Release{nsmtest.Release(1, pcr0, c.status), nsmtest.Release(2, nsmtest.PCRHex(0x55), manifest.StatusActive)}
 		if err := m.Load(signer.Served(uint64(10+i), rel...)); err != nil {
 			t.Fatal(err)
@@ -255,13 +284,9 @@ func TestRegisterManifest(t *testing.T) {
 		t.Fatal(err)
 	}
 	g.clk.add(time.Second)
-	reg := g.do(rawReq{path: pushwire.PathRegister, body: fcmReg.Body(), key: vault})
-	if reg.status != 201 {
-		t.Fatalf("register: %d %s", reg.status, reg.body)
-	}
-	wb, _ := pushwire.ParseRegistered([]byte(reg.body))
+	wb := g.registerWith(vault, fcmReg)
 	age.add(attest.MaxManifestAge - time.Hour)
-	if a := try(); a.status != 201 {
+	if a := try(); a.status != 202 {
 		t.Errorf("under 7 days: %d %s", a.status, a.body)
 	}
 	if g.count("attestation_failures", "reason", "manifest_stale") != 0 {
@@ -283,7 +308,7 @@ func TestRegisterManifest(t *testing.T) {
 	if err := m.Load(signer.Served(21, nsmtest.Release(1, pcr0, manifest.StatusActive))); err != nil {
 		t.Fatal(err)
 	}
-	if a := try(); a.status != 201 {
+	if a := try(); a.status != 202 {
 		t.Errorf("after a refresh: %d %s", a.status, a.body)
 	}
 }
@@ -295,7 +320,7 @@ func TestRegisterBody(t *testing.T) {
 	cases := []struct {
 		name string
 		body string
-		code string // "" = 201
+		code string // "" = 202
 	}{
 		{"fcm", `{"platform":"fcm","token":"t","app_id":"com.vettid.app.staging"}`, ""},
 		{"fcm 4096-byte token", `{"platform":"fcm","token":"` + strings.Repeat("T", 4096) + `","app_id":"com.vettid.app.staging"}`, ""},
@@ -341,7 +366,7 @@ func TestRegisterBody(t *testing.T) {
 		g.clk.add(time.Second)
 		a := g.do(rawReq{path: pushwire.PathRegister, body: []byte(c.body), key: newKey(t), xff: "198.51.100.7"})
 		switch {
-		case c.code == "" && a.status != 201:
+		case c.code == "" && a.status != 202:
 			t.Errorf("%s: %d %s", c.name, a.status, a.body)
 		case c.code != "" && !a.is(400, c.code):
 			t.Errorf("%s: %d %s, want 400 %s", c.name, a.status, a.body, c.code)
@@ -357,7 +382,7 @@ func TestRegisterBody(t *testing.T) {
 	// three become bad_request with the code as message).
 	g.clk.add(time.Minute)
 	_, err := g.vault().Register(context.Background(), newKey(t), pushwire.Registration{Platform: "fcm", Token: "t", AppID: "com.example.other"})
-	var ge *pushwire.Error
+	var ge *pushwire.Error // a refusal reads the same in the vault's client as before
 	if !errors.As(err, &ge) || ge.Status != 400 || ge.Code != pushwire.CodeAppInvalid {
 		t.Fatalf("vault client: %v", err)
 	}
@@ -375,7 +400,7 @@ func TestRegisterChannelRules(t *testing.T) {
 	if a := g.do(rawReq{path: pushwire.PathRegister, body: sandbox.Body(), key: newKey(t)}); !a.is(400, "bad_request") {
 		t.Errorf("sandbox on production: %d %s", a.status, a.body)
 	}
-	if a := g.do(rawReq{path: pushwire.PathRegister, body: apnsReg.Body(), key: newKey(t)}); a.status != 201 {
+	if a := g.do(rawReq{path: pushwire.PathRegister, body: apnsReg.Body(), key: newKey(t)}); a.status != 202 {
 		t.Errorf("production on production: %d %s", a.status, a.body)
 	}
 	if a := g.do(rawReq{path: pushwire.PathRegister, body: fcmReg.Body(), key: newKey(t)}); !a.is(400, "platform_invalid") {

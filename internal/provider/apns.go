@@ -36,6 +36,20 @@ const (
 // APNsPayload is the fixed APNs payload: byte-identical for every wake.
 const APNsPayload = `{"aps":{"alert":{"loc-key":"WAKE_FALLBACK"},"mutable-content":1,"sound":"default"}}`
 
+// The token challenge of a registration (§5.1, §6) is a background push:
+// nothing is shown, and Apple requires priority 5 for it. The app asks
+// for its token, and so receives the challenge, while it is in front.
+const (
+	apnsChallengePushType = "background"
+	apnsChallengePriority = "5"
+)
+
+// APNsChallengePayload is the challenge's payload: the code is its only
+// variable part. A code is base64url, so it needs no JSON escaping.
+func APNsChallengePayload(code string) string {
+	return `{"aps":{"content-available":1},"c":"` + code + `"}`
+}
+
 // Provider tokens: Apple refuses a token older than an hour and a token
 // refreshed more often than every 20 minutes.
 const (
@@ -188,15 +202,23 @@ func (c *APNsClient) send(ctx context.Context, m Message, renew bool) Result {
 	}
 	// The token is 64-200 lowercase hex digits (checked at registration,
 	// and again by the caller after the blob opens): safe in a path.
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, base+"/3/device/"+m.Token, bytes.NewReader([]byte(APNsPayload)))
+	payload, pushType, priority, expiration := APNsPayload, apnsPushType, apnsPriority, apnsExpiration
+	if m.Challenge != "" {
+		if !challengeCode(m.Challenge) {
+			return Result{Outcome: Rejected, Detail: "request"}
+		}
+		payload, pushType, priority, expiration = APNsChallengePayload(m.Challenge), apnsChallengePushType,
+			apnsChallengePriority, ChallengeLife
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, base+"/3/device/"+m.Token, bytes.NewReader([]byte(payload)))
 	if err != nil {
 		return Result{Outcome: Rejected, Detail: "request"}
 	}
 	req.Header.Set("authorization", "bearer "+jwt)
-	req.Header.Set("apns-push-type", apnsPushType)
-	req.Header.Set("apns-priority", apnsPriority)
+	req.Header.Set("apns-push-type", pushType)
+	req.Header.Set("apns-priority", priority)
 	req.Header.Set("apns-topic", m.AppID)
-	req.Header.Set("apns-expiration", strconv.FormatInt(now().Add(apnsExpiration).Unix(), 10))
+	req.Header.Set("apns-expiration", strconv.FormatInt(now().Add(expiration).Unix(), 10))
 	req.Header.Set("content-type", "application/json")
 	resp, err := c.HTTP.Do(req)
 	if err != nil {

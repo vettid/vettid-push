@@ -218,7 +218,8 @@ func run(ctx context.Context, cfg config.Config, d deps) error {
 		Channel: cfg.Channel, Keys: keys, Attest: verifier, Providers: providers,
 		AllowSandbox: cfg.AllowSandbox(), TrustProxy: cfg.TrustProxy, Metrics: reg, Log: logger, Dev: dev,
 		Limits: api.Limits{RegisterPerMinute: cfg.RateRegisterPerMinute, WakePerMinute: cfg.RateWakePerMinute,
-			TokenPerHour: cfg.RateTokenPerHour, TokenBurst: cfg.RateTokenBurst, Coalesce: cfg.CoalesceWindow,
+			TokenPerHour: cfg.RateTokenPerHour, TokenBurst: cfg.RateTokenBurst,
+			ChallengePerHour: cfg.RateChallengePerHour, ChallengeBurst: cfg.RateChallengeBurst, Coalesce: cfg.CoalesceWindow,
 			ReplayCacheMax: cfg.ReplayCacheMax},
 	}
 	if !cfg.Dev || len(cfg.FCMAppIDs)+len(cfg.APNsAppIDs) > 0 {

@@ -5,6 +5,12 @@
 //	ct        = XChaCha20-Poly1305(blob_key[key_id], nonce,
 //	                aad = "vettid/push/1/blob" || 0x00 || channel, pt = JSON record)
 //
+// It also seals the pending registration a registration answers with
+// while the push token's challenge is outstanding (§5.1): the same
+// format and keys, the record with the challenge code "c" added, under
+// the associated data "vettid/push/1/pending" || 0x00 || channel, so a
+// pending registration never opens as a wake blob, nor the reverse.
+//
 // Nothing in this package logs, and no error carries blob, key or record
 // material.
 package blob
@@ -34,9 +40,10 @@ const (
 	// KeySize is the length of a blob key.
 	KeySize = chacha20poly1305.KeySize
 
-	aadLabel  = "vettid/push/1/blob"
-	headerLen = 1 + KeyIDLen + chacha20poly1305.NonceSizeX
-	minRawLen = headerLen + chacha20poly1305.Overhead
+	aadLabel     = "vettid/push/1/blob"
+	pendingLabel = "vettid/push/1/pending"
+	headerLen    = 1 + KeyIDLen + chacha20poly1305.NonceSizeX
+	minRawLen    = headerLen + chacha20poly1305.Overhead
 )
 
 var (
@@ -62,7 +69,8 @@ type Record struct {
 	Issued int64
 }
 
-// wire is the record's JSON (§4): {"p","e"?,"a","t","k","i"}.
+// wire is the record's JSON (§4): {"p","e"?,"a","t","k","i"}, and in a
+// pending registration also "c", the challenge code.
 type wire struct {
 	P string `json:"p"`
 	E string `json:"e,omitempty"`
@@ -70,6 +78,7 @@ type wire struct {
 	T string `json:"t"`
 	K string `json:"k"`
 	I int64  `json:"i"`
+	C string `json:"c,omitempty"`
 }
 
 // Keyring holds a channel's blob keys in memory: one current key, which
@@ -199,13 +208,24 @@ func (k *Keyring) KeyIDs() (all []string, current string) {
 	return all, hex.EncodeToString(k.current[:])
 }
 
-func (k *Keyring) aad() []byte {
-	return append(append([]byte(aadLabel), 0x00), k.channel...)
+func (k *Keyring) aad(label string) []byte {
+	return append(append([]byte(label), 0x00), k.channel...)
 }
 
 // Seal makes a blob of r under the current key with a random nonce. The
 // same record sealed twice yields two different blobs; both open.
-func (k *Keyring) Seal(r Record) (string, error) {
+func (k *Keyring) Seal(r Record) (string, error) { return k.seal(r, "", aadLabel) }
+
+// SealPending seals r and the challenge code sent to its token as a
+// pending registration (§5.1): it opens only with OpenPending.
+func (k *Keyring) SealPending(r Record, code string) (string, error) {
+	if code == "" {
+		return "", ErrInvalid
+	}
+	return k.seal(r, code, pendingLabel)
+}
+
+func (k *Keyring) seal(r Record, code, label string) (string, error) {
 	if len(r.Key) != ed25519.PublicKeySize {
 		return "", ErrInvalid
 	}
@@ -213,7 +233,7 @@ func (k *Keyring) Seal(r Record) (string, error) {
 	enc := json.NewEncoder(&pt)
 	enc.SetEscapeHTML(false)
 	if err := enc.Encode(wire{P: r.Platform, E: r.Environment, A: r.AppID, T: r.Token,
-		K: base64.StdEncoding.EncodeToString(r.Key), I: r.Issued}); err != nil {
+		K: base64.StdEncoding.EncodeToString(r.Key), I: r.Issued, C: code}); err != nil {
 		return "", ErrInvalid
 	}
 	body := bytes.TrimSuffix(pt.Bytes(), []byte("\n"))
@@ -226,7 +246,7 @@ func (k *Keyring) Seal(r Record) (string, error) {
 	if _, err := rand.Read(out[1+KeyIDLen:]); err != nil {
 		return "", err
 	}
-	out = k.keys[k.current].Seal(out, out[1+KeyIDLen:headerLen], body, k.aad())
+	out = k.keys[k.current].Seal(out, out[1+KeyIDLen:headerLen], body, k.aad(label))
 	return base64.RawURLEncoding.EncodeToString(out), nil
 }
 
@@ -234,34 +254,52 @@ func (k *Keyring) Seal(r Record) (string, error) {
 // current key; if not, the caller answers the wake with a reseal (§4).
 // Every failure is ErrInvalid.
 func (k *Keyring) Open(blob string) (r Record, current bool, err error) {
-	if len(blob) == 0 || len(blob) > MaxLen {
+	r, code, current, err := k.open(blob, aadLabel)
+	if err != nil || code != "" {
 		return Record{}, false, ErrInvalid
+	}
+	return r, current, nil
+}
+
+// OpenPending opens a pending registration and returns its record and
+// challenge code. Every failure is ErrInvalid.
+func (k *Keyring) OpenPending(pending string) (r Record, code string, err error) {
+	r, code, _, err = k.open(pending, pendingLabel)
+	if err != nil || code == "" {
+		return Record{}, "", ErrInvalid
+	}
+	return r, code, nil
+}
+
+func (k *Keyring) open(blob, label string) (r Record, code string, current bool, err error) {
+	if len(blob) == 0 || len(blob) > MaxLen {
+		return Record{}, "", false, ErrInvalid
 	}
 	raw, err := base64.RawURLEncoding.Strict().DecodeString(blob)
 	if err != nil || len(raw) < minRawLen || raw[0] != Version {
-		return Record{}, false, ErrInvalid
+		return Record{}, "", false, ErrInvalid
 	}
 	var id [KeyIDLen]byte
 	copy(id[:], raw[1:])
 	aead, ok := k.keys[id]
 	if !ok {
-		return Record{}, false, ErrInvalid
+		return Record{}, "", false, ErrInvalid
 	}
-	pt, err := aead.Open(nil, raw[1+KeyIDLen:headerLen], raw[headerLen:], k.aad())
+	pt, err := aead.Open(nil, raw[1+KeyIDLen:headerLen], raw[headerLen:], k.aad(label))
 	if err != nil {
-		return Record{}, false, ErrInvalid
+		return Record{}, "", false, ErrInvalid
 	}
 	var w wire
 	dec := json.NewDecoder(bytes.NewReader(pt))
 	dec.DisallowUnknownFields()
 	if err := dec.Decode(&w); err != nil || dec.More() {
-		return Record{}, false, ErrInvalid
+		return Record{}, "", false, ErrInvalid
 	}
 	key, err := base64.StdEncoding.Strict().DecodeString(w.K)
 	if err != nil || len(key) != ed25519.PublicKeySize || w.I < 0 {
-		return Record{}, false, ErrInvalid
+		return Record{}, "", false, ErrInvalid
 	}
-	return Record{Platform: w.P, Environment: w.E, AppID: w.A, Token: w.T, Key: key, Issued: w.I},
+	return Record{Platform: w.P, Environment: w.E, AppID: w.A, Token: w.T, Key: key, Issued: w.I}, w.C,
 		subtle.ConstantTimeCompare(id[:], k.current[:]) == 1, nil
 }
 

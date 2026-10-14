@@ -5,6 +5,8 @@ import (
 	"context"
 	"crypto/ed25519"
 	"crypto/rand"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"io"
 	"log/slog"
@@ -48,21 +50,43 @@ func (c *clock) set(t time.Time, step time.Duration) {
 	c.mu.Unlock()
 }
 
-// fakeProvider records what the gateway hands a platform client.
+// fakeProvider records what the gateway hands a platform client: wakes
+// in sent, registration challenges in chals (the phone that holds the
+// token would receive those).
 type fakeProvider struct {
-	mu     sync.Mutex
-	sent   []provider.Message
-	result provider.Result
+	mu         sync.Mutex
+	sent       []provider.Message
+	result     provider.Result
+	chals      []provider.Message
+	chalResult provider.Result
 }
 
 func (f *fakeProvider) Send(_ context.Context, m provider.Message) provider.Result {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	if m.Challenge != "" {
+		f.chals = append(f.chals, m)
+		return f.chalResult
+	}
 	f.sent = append(f.sent, m)
 	return f.result
 }
-func (f *fakeProvider) set(r provider.Result) { f.mu.Lock(); f.result = r; f.mu.Unlock() }
-func (f *fakeProvider) count() int            { f.mu.Lock(); defer f.mu.Unlock(); return len(f.sent) }
+func (f *fakeProvider) set(r provider.Result)     { f.mu.Lock(); f.result = r; f.mu.Unlock() }
+func (f *fakeProvider) setChal(r provider.Result) { f.mu.Lock(); f.chalResult = r; f.mu.Unlock() }
+func (f *fakeProvider) count() int                { f.mu.Lock(); defer f.mu.Unlock(); return len(f.sent) }
+func (f *fakeProvider) chalCount() int            { f.mu.Lock(); defer f.mu.Unlock(); return len(f.chals) }
+
+// lastChallenge is the most recent challenge sent to token.
+func (f *fakeProvider) lastChallenge(token string) (provider.Message, bool) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	for i := len(f.chals) - 1; i >= 0; i-- {
+		if f.chals[i].Token == token {
+			return f.chals[i], true
+		}
+	}
+	return provider.Message{}, false
+}
 
 // syncBuffer is a goroutine-safe log sink.
 type syncBuffer struct {
@@ -119,6 +143,9 @@ func newGWAt(t *testing.T, at time.Time, opts ...opt) *gw {
 		Log:          slog.New(slog.NewJSONHandler(g.logs, nil)),
 		Now:          g.clk.now,
 	}
+	// Tests register the same few tokens many times; the challenge
+	// limit has its own test, with the default.
+	g.cfg.Limits.ChallengeBurst = 1000
 	for _, o := range opts {
 		o(g)
 	}
@@ -172,15 +199,89 @@ var (
 		AppID: "com.vettid.app.staging", Environment: "production"}
 )
 
-// register registers r with a fresh wake key through the vault client.
+// register registers r with a fresh wake key, both steps: the
+// registration, then the confirmation with the code the phone received.
 func (g *gw) register(r pushwire.Registration) (ed25519.PrivateKey, string) {
 	g.t.Helper()
 	k := newKey(g.t)
-	b, err := g.vault().Register(context.Background(), k, r)
-	if err != nil {
-		g.t.Fatalf("register: %v", err)
+	return k, g.registerWith(k, r)
+}
+
+// registerWith is register with a given wake key.
+func (g *gw) registerWith(k ed25519.PrivateKey, r pushwire.Registration) string {
+	g.t.Helper()
+	pending := g.registerPending(k, r)
+	a := g.confirm(k, pending, g.code(r))
+	if a.status != http.StatusCreated {
+		g.t.Fatalf("confirm: %d %s", a.status, a.body)
 	}
-	return k, b
+	wb, err := pushwire.ParseRegistered([]byte(a.body))
+	if err != nil {
+		g.t.Fatalf("confirm answer %s: %v", a.body, err)
+	}
+	return wb
+}
+
+// registerPending sends the registration (first step) and returns the
+// pending registration of its 202.
+func (g *gw) registerPending(k ed25519.PrivateKey, r pushwire.Registration) string {
+	g.t.Helper()
+	a := g.do(rawReq{path: pushwire.PathRegister, body: r.Body(), key: k})
+	p, ok := parsePending(a)
+	if !ok {
+		g.t.Fatalf("register: %d %s", a.status, a.body)
+	}
+	return p
+}
+
+// parsePending reads a registration's 202 {pending}.
+func parsePending(a answer) (string, bool) {
+	var v struct {
+		Pending string `json:"pending"`
+	}
+	if a.status != http.StatusAccepted || json.Unmarshal([]byte(a.body), &v) != nil || !pushwire.ValidBlob(v.Pending) {
+		return "", false
+	}
+	return v.Pending, true
+}
+
+// code is the challenge code the phone holding r's token last received.
+func (g *gw) code(r pushwire.Registration) string {
+	g.t.Helper()
+	if d := g.cfg.Dev; d != nil {
+		th := sha256.Sum256([]byte(r.Token))
+		cs := d.Challenges()
+		for i := len(cs) - 1; i >= 0; i-- {
+			if cs[i].TokenSHA256 == hex.EncodeToString(th[:]) {
+				return cs[i].Code
+			}
+		}
+		g.t.Fatal("the stand-in recorded no challenge for the token")
+	}
+	p := g.fcm
+	if r.Platform == provider.APNs {
+		p = g.apns
+	}
+	m, ok := p.lastChallenge(r.Token)
+	if !ok {
+		g.t.Fatal("no challenge was sent to the token")
+	}
+	return m.Challenge
+}
+
+// confirmBody is the body of POST /v1/confirm.
+func confirmBody(pending, code string) []byte {
+	b, _ := json.Marshal(struct {
+		Pending string `json:"pending"`
+		Code    string `json:"code"`
+	}{pending, code})
+	return b
+}
+
+// confirm sends the second step, signed by k.
+func (g *gw) confirm(k ed25519.PrivateKey, pending, code string) answer {
+	g.t.Helper()
+	return g.do(rawReq{path: PathConfirm, body: confirmBody(pending, code), key: k})
 }
 
 // answer is a raw gateway answer.

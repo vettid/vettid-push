@@ -20,12 +20,13 @@ const minReplayPerKey = 32
 // (§3), and the per-token limit admits at most TokenBurst wakes plus
 // the bucket's refill during one record's life: 10 + 4 with the
 // defaults. Every wake beyond that is refused at the token limit
-// whatever the vault does, so with the key's one registration that is
-// all the records a vault can put to use; the cap is twice that, for
-// retries signed anew and a clock that is off, and never under 32.
+// whatever the vault does, so with the key's one registration and its
+// confirmation that is all the records a vault can put to use; the cap
+// is twice that, for retries signed anew and a clock that is off, and
+// never under 32.
 func replayPerKey(l Limits) int {
 	refill := (l.TokenPerHour*int(replayRecordLife/time.Second) + 3599) / 3600
-	if n := 2 * (l.TokenBurst + refill + 1); n > minReplayPerKey {
+	if n := 2 * (l.TokenBurst + refill + 2); n > minReplayPerKey {
 		return n
 	}
 	return minReplayPerKey

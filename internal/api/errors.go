@@ -12,6 +12,7 @@ const (
 	CodeTimestampStale      = "timestamp_stale"
 	CodeReplayDetected      = "replay_detected"
 	CodeAttestationInvalid  = "attestation_invalid"
+	CodeChallengeInvalid    = "challenge_invalid"
 	CodeBadRequest          = "bad_request"
 	CodePlatformInvalid     = "platform_invalid"
 	CodeAppInvalid          = "app_invalid"
@@ -29,7 +30,7 @@ func statusFor(code string) int {
 	switch code {
 	case CodeSignatureInvalid, CodeTimestampStale, CodeReplayDetected:
 		return http.StatusUnauthorized
-	case CodeAttestationInvalid:
+	case CodeAttestationInvalid, CodeChallengeInvalid:
 		return http.StatusForbidden
 	case CodeBadRequest, CodePlatformInvalid, CodeAppInvalid, CodeTokenInvalid:
 		return http.StatusBadRequest
@@ -53,6 +54,7 @@ var messages = map[string]string{
 	CodeTimestampStale:      "request timestamp outside the freshness window",
 	CodeReplayDetected:      "request replay detected",
 	CodeAttestationInvalid:  "attestation invalid",
+	CodeChallengeInvalid:    "push token challenge invalid",
 	CodeBadRequest:          "malformed request",
 	CodePlatformInvalid:     "platform unknown",
 	CodeAppInvalid:          "app id not accepted",

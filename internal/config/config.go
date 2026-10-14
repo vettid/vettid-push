@@ -57,6 +57,8 @@ type Config struct {
 	RateWakePerMinute     int           // PUSH_RATE_WAKE_PER_MINUTE
 	RateTokenPerHour      int           // PUSH_RATE_TOKEN_PER_HOUR
 	RateTokenBurst        int           // PUSH_RATE_TOKEN_BURST
+	RateChallengePerHour  int           // PUSH_RATE_CHALLENGE_PER_HOUR
+	RateChallengeBurst    int           // PUSH_RATE_CHALLENGE_BURST
 	CoalesceWindow        time.Duration // PUSH_COALESCE_WINDOW (0 disables)
 	ReplayCacheMax        int           // PUSH_REPLAY_CACHE_MAX
 
@@ -81,6 +83,8 @@ func Defaults() Config {
 		RateWakePerMinute:     6000,
 		RateTokenPerHour:      60,
 		RateTokenBurst:        10,
+		RateChallengePerHour:  10,
+		RateChallengeBurst:    5,
 		CoalesceWindow:        2 * time.Second,
 		ReplayCacheMax:        200_000,
 	}
@@ -181,6 +185,8 @@ func Load(lookup func(string) (string, bool), dev bool) (Config, error) {
 	integer("PUSH_RATE_WAKE_PER_MINUTE", &c.RateWakePerMinute)
 	integer("PUSH_RATE_TOKEN_PER_HOUR", &c.RateTokenPerHour)
 	integer("PUSH_RATE_TOKEN_BURST", &c.RateTokenBurst)
+	integer("PUSH_RATE_CHALLENGE_PER_HOUR", &c.RateChallengePerHour)
+	integer("PUSH_RATE_CHALLENGE_BURST", &c.RateChallengeBurst)
 	dur("PUSH_COALESCE_WINDOW", &c.CoalesceWindow, true)
 	integer("PUSH_REPLAY_CACHE_MAX", &c.ReplayCacheMax)
 

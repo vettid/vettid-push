@@ -8,6 +8,12 @@ CONTAINER ?= $(shell command -v docker || command -v podman)
 # The image's timestamps: the commit's, so that two builds of one commit
 # are the same image (make image-repro).
 SOURCE_DATE_EPOCH ?= $(shell git log -1 --format=%ct 2>/dev/null || echo 0)
+# IMAGE_MIRROR=REGISTRY/PATH (CI: ghcr.io/vettid/mirror, vettid.org
+# .github/mirror): the Dockerfile's digest-pinned docker.io base images,
+# same digests, from that mirror (--build-context); the Dockerfile and the
+# image are unchanged.
+IMAGE_MIRROR ?=
+MIRROR_CONTEXTS = $(if $(IMAGE_MIRROR),$(shell sed -nE 's|^FROM (--platform=[^ ]+ )?(docker\.io/[^ ]*/([^/:@ ]+)(:[^@ ]+)?@(sha256:[0-9a-f]{64})).*|--build-context \2=docker-image://$(IMAGE_MIRROR)/\3@\5|p' Dockerfile))
 # Tests run two packages at a time: several suites generate RSA and EC
 # keys, and a developer machine has other work to do.
 TESTFLAGS ?= -p 2
@@ -51,9 +57,9 @@ image-multiarch:
 image-repro:
 	@set -e; \
 	if $(CONTAINER) --version | grep -qi podman; then \
-	  build() { $(CONTAINER) build --no-cache --timestamp $(SOURCE_DATE_EPOCH) --build-arg VERSION=$(VERSION) -t $$1 . >/dev/null; }; \
+	  build() { $(CONTAINER) build --no-cache --timestamp $(SOURCE_DATE_EPOCH) $(MIRROR_CONTEXTS) --build-arg VERSION=$(VERSION) -t $$1 . >/dev/null; }; \
 	else \
-	  build() { SOURCE_DATE_EPOCH=$(SOURCE_DATE_EPOCH) $(CONTAINER) buildx build --no-cache --build-arg VERSION=$(VERSION) \
+	  build() { SOURCE_DATE_EPOCH=$(SOURCE_DATE_EPOCH) $(CONTAINER) buildx build --no-cache $(MIRROR_CONTEXTS) --build-arg VERSION=$(VERSION) \
 	    --output type=docker,name=$$1,rewrite-timestamp=true . >/dev/null; }; \
 	fi; \
 	build vettid-push:repro-a; build vettid-push:repro-b; \

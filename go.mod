@@ -2,6 +2,8 @@ module github.com/vettid/vettid-push
 
 go 1.26.0
 
+toolchain go1.26.11
+
 require (
 	github.com/aws/aws-sdk-go-v2 v1.47.3
 	github.com/aws/aws-sdk-go-v2/config v1.33.6
